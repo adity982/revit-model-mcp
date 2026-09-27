@@ -4,44 +4,57 @@
 
 The [Python server](../server/revit_model_mcp/server.py) registers read tools and optional action tools, then constructs jobs.
 [RevitReadChannel](../server/revit_model_mcp/revit_channel.py) serializes calls with an asyncio lock.
+The [pipe host](../server/revit_model_mcp/pipe_host.py) serves `REVIT_MCP_HOST=local`: it reads heartbeats, talks pipe/1 to the selected add-in and falls back to the file channel.
 The [HTTP host](../server/revit_model_mcp/http_host.py) submits jobs and polls results by ID.
 The [PowerShell host](../server/revit_model_mcp/ssh_host.py) publishes jobs and reads responses locally or through SSH.
-The [add-in application](../src/RevitModelMcp.Addin/Application.cs) creates the Revit ExternalEvent and heartbeat.
-The core project contains parsers, data contracts and serializers without Revit API references.
+The [add-in application](../src/RevitModelMcp.Addin/Application.cs) creates the Revit ExternalEvent, the [pipe listener](../src/RevitModelMcp.Addin/Control/PipeChannel.cs) and the heartbeat.
+The core project contains parsers, data contracts, serializers and the [pipe/1 codec](../src/RevitModelMcp.Core/Control/PipeProtocol.cs) without Revit API references.
 
 ```mermaid
 flowchart LR
-    Client[MCP client] <-->|stdio| Server[Python server]
+    Client[MCP client] <-->|stdio, optionally through SSH| Server[Python server]
+    Server <-->|named pipe pipe/1| Pipe[PipeChannel]
     Server <-->|local PowerShell or SSH| Files[Windows file channel]
     Files --> Watcher[FileSystemWatcher and timer]
-    Watcher --> Event[ExternalEvent]
     Server <-->|HTTP + bearer token| HTTP[HttpListener]
-    HTTP --> Event
+    Pipe --> Scheduler[JobScheduler]
+    Watcher --> Scheduler
+    HTTP --> Scheduler
+    Scheduler --> Event[ExternalEvent]
     Event --> Handler[Read and action handlers]
     Handler --> Files
+    Handler --> Pipe
     Handler --> HTTP
 ```
+
+## Pipe request lifecycle
+
+1. The server reads fresh heartbeats in ROOT and selects one target with the same rules as the file channel.
+2. If the heartbeat lists `pipe/1`, it opens `\\.\pipe\RevitModelMcp.<pid>` and sends `hello`; the reply must match the heartbeat `pid` and `instanceId`.
+3. The server sends `submit` with the job; the add-in queues it in the shared scheduler and requests an ExternalEvent.
+4. The add-in pushes state changes and one final message with the command response. Pipe threads never call the Revit API.
+5. On disconnect the add-in cancels that connection's queued jobs; a running job finishes, and a reconnected client can ask for its `status`.
 
 ## File request lifecycle
 
 1. Under its existing job lock, the server discovers processes and heartbeats in ROOT and selects one target.
 2. It pins the PID, `startedUtc` identity and `ROOT\instances\<pid>` directory, then confirms the v2 channel with a bounded correlated ping.
-3. It verifies the selected process and identity again, writes a unique `mcp_<uuid>.tmp` and atomically moves it to that directory's `trigger.txt` without overwriting.
+3. It verifies the selected process and identity again, writes a unique `mcp_<uuid>.tmp` and atomically moves it to `job_<jobId>.json` in that directory.
 4. The instance's watcher requests an ExternalEvent; a 10-second timer provides a fallback check.
-5. Revit checks the PID and claims the trigger in its API context. Directed reads recheck the active document; actions resolve the addressed open document.
+5. The watcher moves the job into a thread-safe scheduler and removes its file. Revit checks the PID and active document in its API context; actions resolve the addressed open document.
 6. Readers atomically write correlated responses in the same directory. Paged sessions request further ExternalEvent callbacks until complete.
 7. The server polls that fixed directory and validates response correlation and PID. It copies exported PNGs and cleans only the current job's files there.
 
 Jobs contain a `command` and command-specific fields.
 Successful responses contain `command`, `success` and `data`.
-Responses also carry timing and responder metadata.
+Responses also carry timing, responder and client metadata, `jobId` and `queuedMs`.
 See the [response contracts](../src/RevitModelMcp.Core/Models/ReadCommandModels.cs).
 The server gives each job a fresh `correlationId`; v2 responses must echo it.
 Late responses from other jobs are ignored.
-HTTP assigns a `jobId` and polls `/jobs/{id}`; completed results expire after ten minutes.
+The server assigns a `jobId` and a process-wide `clientId`; `clientName` comes from MCP initialize. HTTP polls `/jobs/{id}`. Completed results expire after ten minutes.
 The asyncio lock serializes calls within one server process only.
 Clients targeting different PIDs use separate directories.
-Clients targeting the same PID still contend for one channel.
+Clients targeting the same PID have separate FIFO queues. The scheduler rotates between clients and executes one job or read-session slice per ExternalEvent.
 
 ## Revit context and model access
 
@@ -61,14 +74,16 @@ File output, logs and optional window activation are observable side effects.
 Each Revit instance writes `ROOT\instance_<processId>.json` every five seconds.
 The heartbeat preserves process ID, Revit version, active document title, path and `updatedUtc`.
 It also reports `fileChannelVersion=2`, a `startedUtc` identity fixed at startup, and nullable `httpPort` populated only after a successful listener bind.
+Discovery version 3 adds a per-process `instanceId`, `pipeName`, `protocols` and every open non-linked document.
+The first heartbeat is written after the pipe listens, so `pipe/1` is never advertised for a pipe that is not accepting clients.
 The add-in caches document information from Revit events before the timer writes it.
 Heartbeat replacement uses a temporary file and `File.Replace` or `File.Move`.
-Discovery reads only ROOT and combines fresh heartbeat data with every running Revit process.
+File discovery reads only ROOT and combines fresh heartbeat data with every running Revit process.
 Missing, malformed or expired heartbeats leave the process visible with `pluginResponding=false` and empty document fields.
 For v2, a fresh heartbeat is a pre-check; `pluginResponding=true` requires a bounded ping confirming correlation, responder PID and unchanged startup identity.
 Busy or timed-out handshakes never remove a process from discovery.
 
-Each instance watches only its own `ROOT\instances\<pid>\trigger.txt`.
+Each instance watches `job_*.json` and legacy `trigger.txt` in its own `ROOT\instances\<pid>` directory.
 Responses, atomic temporary files, PNGs, `latest.json`, `latest.txt`, `snapshot_*.json` and `views_dump_*` share that per-PID directory.
 Startup moves any stale working trigger aside before the watcher starts.
 Cleanup never targets another instance's directory, and later discovery cannot redirect an outstanding job.
@@ -89,8 +104,8 @@ See [transport compatibility](transport.md#file-protocol-compatibility).
 
 ## Failure behavior
 
-A pre-existing trigger produces a busy error.
-A pickup timeout leaves the pending trigger in place.
+A seventeenth queued job from one client returns `queue_full` with `retryAfterMs`.
+A pickup timeout leaves the pending job file in place.
 The job can execute after the caller receives that timeout.
 A response timeout means pickup occurred but no new response was found within the response budget.
 Network polling retries transient SSH and command timeout failures.

@@ -72,6 +72,7 @@ For manual Claude Desktop registration, add to its MCP configuration:
 ```
 
 From a clone, `uv run --directory server revit-model-mcp` runs the same server without installing the package.
+With `REVIT_MCP_HOST=local` the server reaches each Revit through its own named pipe, restricted to the Windows user running Revit; no port or URL reservation is needed.
 For macOS or Linux clients, configure a [remote workstation](#remote-workstations).
 
 ### Check
@@ -115,20 +116,36 @@ See the [full tool reference](https://sharafutdinovdi.github.io/revit-model-mcp/
 
 <a id="actions-opt-in"></a>
 
-Actions are opt-in: both `REVIT_MCP_ALLOW_WRITE=1` in the server and the workstation `allow-write` file are required.
-Model mutations support `dry_run` previews and return `verification`; `revit_batch` groups actions into one undo entry.
+Actions are enabled by default: opt out with `REVIT_MCP_READ_ONLY=1` in the server, or the workstation `read-only` file.
+Model mutations support `dry_run` previews and return `verification` and a human-readable `summary`; a committed action assimilates into one named Revit undo entry, visible in the add-in's "MCP activity" pane; `revit_undo_last` undoes it while it is still Revit's last change.
 See [actions](https://sharafutdinovdi.github.io/revit-model-mcp/actions/) for gates, exceptions and verification failures.
 
 ## Remote workstations
 
 Local Windows clients use `REVIT_MCP_HOST=local` under the Revit user's account.
-Remote clients can use an SSH tunnel to the workstation's loopback endpoint.
-HTTP requires a bearer token except for `/health` and binds to loopback by default; see [transport setup](https://sharafutdinovdi.github.io/revit-model-mcp/transport/).
+Remote clients run the whole server on the workstation over SSH, as the same Windows user that runs Revit.
+Install it there once with `uv tool install revit-model-mcp`, then register `ssh` as the command:
+
+```json
+{
+  "mcpServers": {
+    "revit-model-mcp": {
+      "command": "ssh",
+      "args": ["revit-pc", "revit-model-mcp", "--redact-paths"]
+    }
+  }
+}
+```
+
+Replace `revit-pc` with the workstation's SSH host alias.
+MCP stdio flows through the SSH session and the remote server uses the named pipe, so no port opens.
+`REVIT_MCP_HOST=ssh:<alias>` (file channel over SSH) and HTTP through an SSH tunnel remain available; HTTP requires a bearer token except for `/health` and binds to loopback by default.
+See [transport setup](https://sharafutdinovdi.github.io/revit-model-mcp/transport/).
 
 ## Security
 
 The default tools read the model without model-changing transactions; exports and channel operations write files outside it.
-MCP actions require both gates, while direct HTTP callers require the bearer token and workstation gate.
+MCP actions are refused in read-only mode, while direct HTTP callers require the bearer token and are refused while the workstation read-only file is present.
 `REVIT_MCP_REDACT_PATHS=1` hides directories in response path fields, but names, parameter values, errors, channel files and exported image `localPath` values remain visible.
 See [security details](https://sharafutdinovdi.github.io/revit-model-mcp/security/) for authentication and privacy boundaries, and [SECURITY.md](SECURITY.md) to report a vulnerability.
 

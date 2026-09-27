@@ -9,11 +9,11 @@ Its default channel is `%LOCALAPPDATA%\RevitModelMcp`.
 
 | Location | Contents |
 |---|---|
-| Channel directory | `trigger.txt`, `mcp_<uuid>.tmp`, `response_<timestamp>_<command>.json`, `view_<timestamp>_<id>.png`, `instance_<processId>.json` and heartbeat `.tmp` files |
+| Channel directory | `job_<jobId>.json`, legacy `trigger.txt`, `mcp_<uuid>.tmp`, `response_<timestamp>_<command>.json`, `view_<timestamp>_<id>.png`, `instance_<processId>.json` and heartbeat `.tmp` files |
 | Channel directory, legacy snapshots | `latest.json`, `latest.txt`, `snapshot_yyyyMMdd_HHmmss.json` |
 | Channel directory, legacy view dumps | `views_dump_yyyyMMdd_HHmmss_fff.json` and matching `.txt`; a numeric suffix avoids existing names |
 | `%LOCALAPPDATA%\RevitModelMcp\settings.json` | HTTP listener settings and persistent bearer token |
-| `%LOCALAPPDATA%\RevitModelMcp\allow-write` | Workstation action gate; file existence enables actions |
+| `%LOCALAPPDATA%\RevitModelMcp\read-only` | Workstation action gate; file existence switches actions to read-only mode |
 | Windows Documents folder, `RevitModelMcp\Logs` | `RevitModelMcp-yyyyMMdd.log`, with numbered size rotations |
 | `%TEMP%\RevitModelMcp\Logs` | Log fallback when Documents is unavailable |
 
@@ -27,12 +27,16 @@ HTTP stores completed response JSON in memory; exported PNGs still use the chann
 MCP tools translate snake_case arguments into channel JSON fields.
 The request `{"command":"ping"}` checks connectivity without an active model.
 Read jobs may contain `targetDocument`; actions add `targetProcessId` from instance discovery.
+Every server job contains a GUID `jobId`, a per-process GUID `clientId`, and `clientName` from MCP initialize (or `unknown`).
+The response envelope adds `client:{name,id}`, `jobId`, and `queuedMs`.
+`family-audit` contains `families` only in project mode. `edit-families` contains `operations` and may contain `families`; the addressed Revit document determines the mode.
 `targetDocument` matches a case-insensitive substring of the active document title or path basename in the add-in.
 An HTTP endpoint also rejects jobs addressed to another process.
 
 | MCP arguments | JSON fields |
 |---|---|
 | `document` | `targetDocument` |
+| `cancel_job_id` | `cancelJobId` for the `jobs` read command |
 | `element_id` | `id` for `element-details`; `elementId` for `set-parameter` |
 | `element_ids` | `elementIds` |
 | `dry_run` | `dryRun` (optional boolean, defaults to false) |
@@ -45,6 +49,15 @@ An HTTP endpoint also rejects jobs addressed to another process.
 | `source_id`, `source_name` | `sourceId`, `sourceName` |
 | `dx_mm`, `dy_mm`, `dz_mm`, `x_mm`, `y_mm` | `dxMm`, `dyMm`, `dzMm`, `xMm`, `yMm` |
 | `start_mm`, `end_mm`, `wall_type`, `height_mm`, `rotation_deg` | `startMm`, `endMm`, `wallType`, `heightMm`, `rotationDeg` |
+| `name_map`, `level_offset_mm`, `reuse_matching`, `tolerance_mm` | `nameMap`, `levelOffsetMm`, `reuseMatching`, `toleranceMm` |
+| `create_missing`, `level_type`, `grid_type`, `include_pinned`, `create_plan_views`, `plan_view_type` | `createMissing`, `levelType`, `gridType`, `includePinned`, `createPlanViews`, `planViewType` |
+| `hide_categories`, `show_categories`, `category_classes`, `hide_categories_by_type` | `hideCategories`, `showCategories`, `categoryClasses`, `hideCategoriesByType` |
+| `worksets`, `filters`, `template_mode` | `worksets:{hideMask,showMask}`, `filters`, `templateMode` |
+| `links`, `kinds`, `include_imported_cad` | `links` (always a list), `kinds`, `includeImportedCad` |
+
+The new command names are `view-info`, `set-view-visibility` and `remove-links`. The last two are action commands and require both write gates. View visibility action responses include `data.visibility` with `changes` (`setting`, `before`, `after`), `categoryFailures`, `matchedWorksets` and `affectedViews`. Link removal responses include `data.linkRemoval.removed` records with type ID, name, kind and instance count, plus an optional warning.
+
+`compare-link-datums` is a read job; `align-link-datums` is an action job. Their `data.items` use `aligned`, `differs` or `moved`, `missing_in_host` or `created`, `host_only`, `unsupported`, and action-only `skipped`. Distances are rounded to 0.1 mm and angles to 0.001 degrees. `data.summary` counts aligned, moved, created, host-only, unsupported and skipped items.
 
 `save_to` and timeouts are client options, not job fields.
 `parameterFilters` entries contain `parameter`, `operator` and an optional `value`.
@@ -212,6 +225,8 @@ Action failures retain the response object and add `error`.
 Transport errors and target mismatches can occur before the action executor and omit these fields.
 See [response models](../src/RevitModelMcp.Core/Models/ReadCommandModels.cs) and [action models](../src/RevitModelMcp.Core/Control/ActionJobParser.cs).
 
+Family responses have `data.mode` (`family` or `project`) and `data.families`. Audit entries include `parameters`, `purgeable`, `purgeableTotal` and `purgeCoverage`; skipped entries include a reason. Edit responses include `dryRun`, `committed`, `failedFamily`, per-family status and ordered operation results. `stopOnError=true` rolls back the project group and marks attempted families `rolledBack:true`. A timed-out response may follow a committed change; inspect the model before retrying.
+
 ## Action writes and batches
 
 The file channel and HTTP accept `dryRun` on `move`, `place-family`, `create-wall`, `set-parameter`, `delete` and `batch`.
@@ -264,6 +279,8 @@ Verification records each step immediately; later steps can supersede those fact
 
 ## Geometry and image exports
 
+`export-nwc` is a gated action job and is excluded from `batch`. It accepts `path`, `scope`, `view`, `elementIds`, `coordinates`, `parameters`, all exporter Boolean options, `facetingFactor`, `overwrite` and `dryRun`. The add-in assigns every `NavisworksExportOptions` property explicitly. The response `data` includes `path`, `bytes`, `sha256`, `elapsedMs`, `scope`, `view`, `elementCount`, `options` with snake_case keys, `dryRun` and `overwritten`. A dry run also reports `exporterAvailable` and `pathChecks` without writing a file. NWC bytes remain on the workstation.
+
 `revit_element_details` returns `location`, `boundingBox` and `roomCenterMm` directly under `data` when available.
 `revit_query_elements(include_geometry=true)` includes them on each returned element.
 Point locations use `type:"point"`, `xMm`, `yMm`, `zMm`.
@@ -289,3 +306,11 @@ Snapshots use the [Snapshot contract](../src/RevitModelMcp.Core/Models/Snapshot.
 View dumps use `command:"views-dump"`, `status`, timestamps, `responder`, progress counts and a `views` list from [ViewDumpReport](../src/RevitModelMcp.Core/Models/ViewDumpReport.cs).
 They track opened/closed views and restoration of the original view.
 Legacy formats have no schema version and should not be treated as a stable external API.
+
+## Document action responses
+
+The read command `documents` returns an array of open document states, including background documents. It does not require an active document or the action gate.
+
+Document lifecycle commands use the normal command response envelope. `open-document` returns `title`, `path`, `isWorkshared`, `isDetached`, `isCentral`, `openedAs`, `active`, `worksetsOpen` and `elapsedMs` in `data`. Open responses also report any suppressed dialogs in the envelope's `dialogsSuppressed` field.
+
+A save, sync or close operation requiring confirmation returns `success:true` and `data.needsConfirmation:true`, `data.confirmationText` and `data.confirmToken`. This response reports a pending operation; it does not mean the operation ran. The follow-up must repeat all arguments and add `confirmToken`. Invalid, consumed, expired or mismatched tokens return an error without making a change. The token expires five minutes after issuance.

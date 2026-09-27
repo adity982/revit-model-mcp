@@ -66,6 +66,7 @@ class SshPowerShellHost:
         self._root_directory = _ps_directory()
         self._directory = self._root_directory
         self._instance: dict[str, object] | None = None
+        self._published_job_file: str | None = None
 
     @property
     def requires_identity(self) -> bool:
@@ -113,16 +114,20 @@ class SshPowerShellHost:
 
     async def list_revit_instances(self, document: str | None = None) -> list[dict[str, object]]:
         instances = await self._discover_instances()
-        for instance in instances:
-            if document and not matches_document(instance, document):
-                continue
+        candidates = [
+            item for item in instances if not document or matches_document(item, document)
+        ]
+
+        async def ping(instance: dict[str, object]) -> None:
             if instance.get("fileChannelVersion") == 2:
                 try:
-                    await self._for_instance(instance)._handshake()
+                    await self._for_instance(instance)._handshake(timeout=5.0)
                     instance["pluginResponding"] = True
                 except RevitChannelError:
                     instance["pluginResponding"] = False
-        return [item for item in instances if not document or matches_document(item, document)]
+
+        await asyncio.gather(*(ping(instance) for instance in candidates))
+        return candidates
 
     async def select_job(self, job: ReadJob) -> tuple[SshPowerShellHost, ReadJob]:
         instances = await self._discover_instances()
@@ -156,18 +161,18 @@ class SshPowerShellHost:
                 "The selected Revit instance identity changed or its heartbeat expired. Retry discovery."
             )
 
-    async def _handshake(self) -> None:
+    async def _handshake(self, timeout: float | None = None) -> None:
+        resolved_timeout = HANDSHAKE_TIMEOUT_SECONDS if timeout is None else timeout
+
         async def confirm() -> None:
             job = ReadJob(
                 "ping", {"command": "ping", "targetProcessId": self._instance["processId"]}
             )
-            await RevitReadChannel(self)._execute_serial(
-                job, HANDSHAKE_TIMEOUT_SECONDS, HANDSHAKE_TIMEOUT_SECONDS
-            )
+            await RevitReadChannel(self)._execute_serial(job, resolved_timeout, resolved_timeout)
             await self._verify_identity()
 
         try:
-            await asyncio.wait_for(confirm(), HANDSHAKE_TIMEOUT_SECONDS)
+            await asyncio.wait_for(confirm(), resolved_timeout)
         except TimeoutError as error:
             raise RevitChannelError(
                 "The selected file channel is unconfirmed: handshake timed out; its ping may still execute later."
@@ -187,22 +192,24 @@ class SshPowerShellHost:
             )
         encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
         pattern = f"response_*_{_ps_quote(command)}*.json"
+        job_id = json.loads(content).get("jobId")
+        if not isinstance(job_id, str) or not re.fullmatch(r"[0-9a-fA-F]{32}", job_id):
+            raise RevitChannelError("A jobId GUID is required before publishing a file job.")
+        target_name = f"job_{job_id}.json"
         script = (
             f"$directory = {self._directory}; "
             f"$revitRunning = $null -ne (Get-Process Revit -ErrorAction SilentlyContinue | Where-Object {{ $_.Id -eq {process_id} }}); "
             f"$responses = @(Get-ChildItem -LiteralPath $directory -Filter '{pattern}' -File -ErrorAction SilentlyContinue | "
             "ForEach-Object { $_.Name }); "
-            "$result = [ordered]@{ revitRunning = $revitRunning; responses = $responses; published = $false; channelBusy = $false }; "
+            "$result = [ordered]@{ revitRunning = $revitRunning; responses = $responses; published = $false }; "
             "if (-not $revitRunning) { $result | ConvertTo-Json -Compress; exit }; "
             + identity_check
             + "New-Item -ItemType Directory -Force -Path $directory | Out-Null; "
-            f"$source = Join-Path $directory '{_ps_quote(name)}'; $target = Join-Path $directory '{TRIGGER_FILE}'; "
-            "if (Test-Path -LiteralPath $target) { $result.channelBusy = $true; $result | ConvertTo-Json -Compress; exit }; "
+            f"$source = Join-Path $directory '{_ps_quote(name)}'; $target = Join-Path $directory '{target_name}'; "
             f"$bytes = [Convert]::FromBase64String('{encoded}'); "
             "[IO.File]::WriteAllBytes($source, $bytes); "
             "try { [IO.File]::Move($source, $target); $result.published = $true } "
-            "catch { Remove-Item -LiteralPath $source -Force -ErrorAction SilentlyContinue; "
-            "if (Test-Path -LiteralPath $target) { $result.channelBusy = $true } else { throw } }; "
+            "catch { Remove-Item -LiteralPath $source -Force -ErrorAction SilentlyContinue; throw }; "
             "$result | ConvertTo-Json -Compress"
         )
         try:
@@ -217,19 +224,16 @@ class SshPowerShellHost:
             raise RevitNotRunningError(
                 f"Revit is not running on {self.host}. Open Revit and a model before calling the tool."
             )
-        if result.get("channelBusy") is True:
-            raise RevitChannelError(
-                "RevitModelMcp channel is busy: trigger.txt already exists. Wait for the current job and retry."
-            )
         if result.get("published") is not True:
             raise RevitChannelError("Remote preparation did not publish the job.")
+        self._published_job_file = target_name
         responses = result.get("responses")
         if not isinstance(responses, list) or not all(isinstance(x, str) for x in responses):
             raise ResponseParseError("Preparation result contains an invalid response list.")
         return set(responses)
 
     async def wait_until_trigger_is_gone(self, timeout_seconds: float) -> JobPickupStatus:
-        trigger_assignment = f"$trigger = Join-Path ({self._directory}) '{TRIGGER_FILE}'; "
+        trigger_assignment = f"$trigger = Join-Path ({self._directory}) '{self._published_job_file or TRIGGER_FILE}'; "
         trigger_check = "if (Test-Path -LiteralPath $trigger) { 'present' } else { 'gone' }"
         check_script = trigger_assignment + trigger_check
         activation_attempts = 0
@@ -243,7 +247,7 @@ class SshPowerShellHost:
             ):
                 activation_attempts = 1
                 LOGGER.warning(
-                    "Job was not picked up within a minute; if trigger.txt is still "
+                    "Job was not picked up within a minute; if its job file is still "
                     "present, the Revit window will be restored and focused "
                     "through scheduled task %s.",
                     ACTIVATION_TASK,
@@ -570,7 +574,16 @@ def _parse_instance_package(
                 "updatedUtc": status["updatedUtc"],
                 **{
                     key: status[key]
-                    for key in ("fileChannelVersion", "startedUtc", "httpPort")
+                    for key in (
+                        "fileChannelVersion",
+                        "startedUtc",
+                        "httpPort",
+                        "discoveryVersion",
+                        "instanceId",
+                        "pipeName",
+                        "protocols",
+                        "documents",
+                    )
                     if key in status
                 },
             }

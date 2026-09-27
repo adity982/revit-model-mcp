@@ -50,7 +50,7 @@ Do this with **Revit closed**. Repeat the whole section for each Revit year pres
 ### 2.1 Local server via `uvx` (Windows workstation)
 - [ ] `uvx revit-model-mcp` resolves and installs the package from PyPI on first run (record package count + time).
 - [ ] Server starts and reports `serverInfo: { name: "Revit Model Reader", version: "<ver>" }` on `initialize`.
-- [ ] `tools/list` returns **18 read tools** (enumerate — see §3).
+- [ ] `tools/list` returns **19 read tools** (enumerate — see §3).
 
 ### 2.2 Claude Code registration (`claude mcp add`)
 - [ ] `claude mcp add revit-model-mcp -s user -e REVIT_MCP_HOST=local -e REVIT_MCP_REDACT_PATHS=1 -- uvx revit-model-mcp` writes to `~/.claude.json`.
@@ -73,7 +73,7 @@ Do this with **Revit closed**. Repeat the whole section for each Revit year pres
 
 ---
 
-## 3. Read tools — full coverage (18)
+## 3. Read tools — full coverage (19)
 
 Model open on the workstation. Call **`revit_list_catalog` first, `revit_aggregate_elements` second, `revit_query_elements` only when rows are needed** (per server guidance). For each tool: record the JSON, confirm `success: true`, spot-check values.
 
@@ -97,17 +97,44 @@ Model open on the workstation. Call **`revit_list_catalog` first, `revit_aggrega
 | 16 | `revit_list_warnings` | "list all model warnings" | model-wide warnings list | [ ] |
 | 17 | `revit_list_relations` | "show hosting/group relations for element <id>" | relation graph (host, hosted, group membership) | [ ] |
 | 18 | `revit_list_instances` | "list instances of family/type <X>" | instances of the named type | [ ] |
+| 19 | `revit_family_audit` | "audit family <X>" | parameter use, shared flag and purge coverage; no project change | [ ] |
 
-- [ ] **3.19 Redaction on**: with `REVIT_MCP_REDACT_PATHS=1`, path fields are redacted but names, parameter values, errors, channel files and export `localPath` remain visible.
-- [ ] **3.20 Redaction off**: `REVIT_MCP_REDACT_PATHS=0` shows full paths.
+- [ ] **3.20 Redaction on**: with `REVIT_MCP_REDACT_PATHS=1`, path fields are redacted but names, parameter values, errors, channel files and export `localPath` remain visible.
+- [ ] **3.21 Redaction off**: `REVIT_MCP_REDACT_PATHS=0` shows full paths.
 
 ---
 
-## 4. Action tools — gated writes (≈9)
+## 4. Action tools — gated writes (11)
 
-Actions require **both gates**: `REVIT_MCP_ALLOW_WRITE=1` **and** the workstation allow-write file. Direct HTTP callers also need the bearer token.
+### Family audit and edits
 
-- [ ] **4.0 Enumerate**: start the server with write enabled and run `tools/list` — record the exact action tool names and count. Known action set from the demo recording (README "In action"): open a view, select element(s), isolate, place a family instance, move an element, and cleanup/undo. Fill the table with the real names.
+- [ ] Open an `.rfa`. Run `revit_family_audit` without `families`; inspect shared status, parameter use and purge counts. Run `revit_edit_families` with an added shared parameter, then save manually.
+- [ ] In a project, audit three editable families. Run the same edit with `dry_run=true`; verify the project is unchanged and no family was loaded.
+- [ ] Run the edit for real; verify one `revit_edit_families` undo entry. Undo and verify that the original family state returns.
+- [ ] Run `set_shared` and confirm the flag in Family Category and Parameters. Check the reported loaded state.
+- [ ] Run `purge` on Revit 2023 and verify coverage `families-and-types`; on Revit 2026 verify `full`.
+- [ ] Verify a used parameter is kept with `usedBy`, an unused shared parameter requires `include_shared=true`, and a missing shared parameter file fails before any edit.
+- [ ] With `replace_family_parameter=true`, give a valid GUID and a different parameter name. Verify the edit fails and the original parameter and its values remain intact.
+- [ ] Cause the first family edit to fail with `stop_on_error=true`. Verify `success:false`, `committed:false`, `failedFamily`, and `rolledBack:true`; confirm the project is unchanged.
+- [ ] Audit enough families for the call to take over 60 seconds. Verify the complete audit returns `success:true` within the configured response timeout.
+
+Actions run by default; either `REVIT_MCP_READ_ONLY=1` **or** the workstation `read-only` file independently switches them off. Direct HTTP callers also need the bearer token.
+
+### NWC export
+
+- [ ] Export a real XML from Navisworks Settings on the owner’s workstation. Compare `nwexportrevit_element_params:0|1|2`, `nwexportrevit_section_extract:0|1|2` and `nwexportrevit_coordinates:0|1` against the displayed settings; correct the three mapping arrays in `NwcSettingsXml` if the order differs.
+- [ ] Run `revit_nwc_settings_check` with that XML. Confirm mapped values, `notApplied` for the four API-unsupported options, and `ignored` for unknown IDs. Confirm no NWC is created.
+- [ ] Run `revit_export_nwc` with `settings_xml` and `dry_run=true`, then override one XML value explicitly. Confirm `options.sources` reports `xml` and `argument` respectively and that unspecified values report `default`.
+
+- [ ] Remove or disable the year-matched Navisworks NWC exporter, or reproduce an exporter startup failure. `revit_export_nwc` reports `Navisworks exporter is not available in Revit <year> on this workstation (not installed or failed to load at startup).`
+- [ ] With the exporter installed, run `dry_run=true` with a new absolute `.nwc` path. Check all effective options and `exporterAvailable:true`; confirm no file is created.
+- [ ] Export the full model with `coordinates="shared"`. Open it in Navisworks and verify alignment with an NWC of a linked model exported the same way.
+- [ ] Export a non-template 3D view with `scope="view"` and an enabled section box. Verify the NWC respects the section box.
+- [ ] Export a 3D view whose exact name is numeric. Verify name lookup works when that number is not a view ID.
+- [ ] Export once with `parameters="all"` and once with `parameters="none"`. Verify element properties disappear in the second NWC.
+- [ ] Export to an existing file without `overwrite`. Verify the error and confirm the original file bytes are unchanged.
+
+- [ ] **4.0 Enumerate**: start the server and run `tools/list` — record the exact action tool names and count. Known action set from the demo recording (README "In action"): open a view, select element(s), isolate, place a family instance, move an element, and cleanup/undo. Fill the table with the real names.
 
 | Action tool (fill from tools/list) | Test | Verify | Cleanup | [ ] |
 |---|---|---|---|---|
@@ -119,12 +146,20 @@ Actions require **both gates**: `REVIT_MCP_ALLOW_WRITE=1` **and** the workstatio
 | delete / cleanup | delete the test instance | element gone | model back to baseline | [ ] |
 | _(others)_ | | | | [ ] |
 
-- [ ] **4.1 Gate negative test**: with only `REVIT_MCP_ALLOW_WRITE=1` but **no** allow-write file (or vice-versa), an action is **refused**. Read tools still work.
+- [ ] **4.1 Gate negative test**: with `REVIT_MCP_READ_ONLY=1`, or the workstation `read-only` file present, an action is **refused** with `read-only mode`; the tool stays listed and read tools still work.
 - [ ] **4.2 HTTP token gate**: a direct HTTP action without the bearer token is refused; `/health` works without token.
 - [ ] **4.3 Transaction safety**: every action wraps a Revit transaction; a failed action leaves the model unchanged (no partial edits).
 - [ ] **4.4 Model restored**: after the action suite, the model matches its pre-test baseline (re-run `revit_aggregate_elements`).
 
 ---
+
+### Link datum alignment
+
+- [ ] Open a host model and a loaded link with a known 25 mm grid shift and 150 mm level shift. `revit_compare_link_datums` reports those deltas without changing the host.
+- [ ] Run `revit_align_link_datums(dry_run=true)`. Shifted datums report `moved`; inspect the host and confirm it is unchanged.
+- [ ] Run the real alignment. Confirm grids and levels move to the link geometry; then use Revit Undo and confirm their original positions return.
+- [ ] Pin a shifted grid. With `include_pinned=false`, confirm `skipped` with reason `pinned` and no movement.
+- [ ] Give a coincident host grid a different name. Confirm the read result says `matchedBy:"geometry"` and the action does not create a duplicate.
 
 ## 5. Transports
 
@@ -176,6 +211,31 @@ Explicit re-tests for things that broke or surprised us:
 - [ ] **8.6** `uvx`/`claude` not on the non-interactive shell PATH (use full paths) — a setup-doc note, not a product bug.
 
 ---
+
+## Document lifecycle validation
+
+- [ ] Call `revit_documents` with no active model, then with active and background models; check every state field and `openedByMcp`.
+
+Use disposable local and Revit Server test models. Check each operation in Revit 2022 through 2027 where available.
+
+- [ ] Open a non-workshared file in the background, then activate another document and close it.
+- [ ] Open local and RSN central models with both detached modes. Confirm the central file remains unchanged.
+- [ ] Create a local copy and verify its destination under `%LOCALAPPDATA%\RevitModelMcp\locals`; refuse an existing destination.
+- [ ] Open all, no and named worksets; verify the returned `worksetsOpen` names.
+- [ ] Reject a cloud path, malformed RSN path, and `read_only_local` on a central or writable file.
+- [ ] Confirm that an active document cannot be closed and a document with an open transaction cannot be closed, saved or synchronized.
+- [ ] Request save, sync and close-with-loss without a token. Confirm no change occurs. Retry after chat approval and verify the exact change.
+- [ ] Retry a consumed, expired or argument-mismatched token and verify no change.
+- [ ] Refuse a detached sync, a family sync and any save-as destination matching a known central path.
+- [ ] Hold the central lock during sync and verify a clear error without indefinite waiting.
+- [ ] Record suppressed dialogs and warnings from a disposable model open; confirm unrelated failures remain visible.
+## View preparation smoke test
+
+- [ ] In a detached workshared model, call `revit_view_info` by name and ID. Check the template controls, 3D background, section box, hidden categories, worksets, filters and links against the Revit UI.
+- [ ] Run `revit_set_view_visibility` with `dry_run=true`; confirm before/after values and no persisted changes. Repeat on an assigned template without `template_mode` (expect rejection), then with each mode and inspect affected views.
+- [ ] Hide category types and named categories, and hide worksets with both glob and `regex:` masks. Confirm unmatched category suggestions and per-category failures.
+- [ ] Run `revit_remove_links` with `dry_run=true`, then on a disposable detached copy. Verify type and instance counts, untouched imported CAD by default, and the central-connected refusal and local-copy sync warning.
+- [ ] Repeat link inspection on Revit 2022–2023 and 2024+ to check the override fallback and `GetLinkOverrides` path.
 
 ## 9. Reporting
 

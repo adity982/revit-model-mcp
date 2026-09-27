@@ -7,6 +7,305 @@ namespace RevitModelMcp.Core.Tests.Control;
 public sealed class ActionJobParserTests
 {
     [Test]
+    public async Task DocumentConfirmationTokens_AreSingleUseBoundAndExpire()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var tokens = new DocumentConfirmationTokens(() => now);
+        var first = tokens.Issue("save-document", "document-1", "path=A", "state-1");
+        await Assert.That(tokens.Consume(first, "save-document", "document-1", "path=B", "state-1")).IsEqualTo(DocumentConfirmationResult.Invalid);
+        await Assert.That(tokens.Consume(first, "save-document", "document-1", "path=A", "state-1")).IsEqualTo(DocumentConfirmationResult.Invalid);
+        var second = tokens.Issue("save-document", "document-1", "path=A", "state-1");
+        await Assert.That(tokens.Consume(second, "save-document", "document-1", "path=A", "state-1")).IsEqualTo(DocumentConfirmationResult.Valid);
+        await Assert.That(tokens.Consume(second, "save-document", "document-1", "path=A", "state-1")).IsEqualTo(DocumentConfirmationResult.Invalid);
+        var third = tokens.Issue("save-document", "document-1", "path=A", "state-1");
+        now = now.AddMinutes(5);
+        await Assert.That(tokens.Consume(third, "save-document", "document-1", "path=A", "state-1")).IsEqualTo(DocumentConfirmationResult.Invalid);
+    }
+
+    [Test]
+    public async Task DocumentConfirmationBinding_IssueThenConfirm_SucceedsDespiteUnrelatedFieldChanges()
+    {
+        var tokens = new DocumentConfirmationTokens();
+        var issueAction = new ActionJobContract
+        {
+            Document = "Tower",
+            Save = true,
+            Comment = "grids",
+            ElementIds = [1, 2, 3],
+            DryRun = false
+        };
+        var identity = DocumentConfirmationBinding.Identity(@"C:\Models\Tower.rvt", "Tower.rvt");
+        var arguments = DocumentConfirmationBinding.Arguments(issueAction, @"C:\Models\Tower.rvt", isModified: true);
+        var state = DocumentConfirmationBinding.State(Guid.NewGuid(), 3, Guid.NewGuid(), 7);
+        var token = tokens.Issue("save-document", identity, arguments, state);
+
+        // The confirming call carries fields that never enter the fingerprint (a fresh element
+        // selection here stands in for the request's transport metadata, which lives entirely
+        // outside ActionJobContract) plus the confirm_token itself, but the same business arguments.
+        var confirmAction = new ActionJobContract
+        {
+            Document = "Tower",
+            Save = true,
+            Comment = "grids",
+            ElementIds = [9, 8],
+            DryRun = false,
+            ConfirmToken = token
+        };
+        var confirmIdentity = DocumentConfirmationBinding.Identity(@"C:\Models\Tower.rvt", "Tower.rvt");
+        var confirmArguments = DocumentConfirmationBinding.Arguments(confirmAction, @"C:\Models\Tower.rvt", isModified: true);
+
+        await Assert.That(tokens.Consume(token, "save-document", confirmIdentity, confirmArguments, state)).IsEqualTo(DocumentConfirmationResult.Valid);
+    }
+
+    [Test]
+    public async Task DocumentConfirmationBinding_StateChangeRejectsConfirmation()
+    {
+        var versionGuid = Guid.NewGuid();
+        var sessionId = Guid.NewGuid();
+        var initial = DocumentConfirmationBinding.State(versionGuid, 3, sessionId, 7);
+        var changedVersion = DocumentConfirmationBinding.State(Guid.NewGuid(), 3, sessionId, 7);
+        var changedSaves = DocumentConfirmationBinding.State(versionGuid, 4, sessionId, 7);
+        var changedSession = DocumentConfirmationBinding.State(versionGuid, 3, Guid.NewGuid(), 7);
+        var changedCount = DocumentConfirmationBinding.State(versionGuid, 3, sessionId, 8);
+        var tokens = new DocumentConfirmationTokens();
+
+        await Assert.That(initial).IsNotEqualTo(changedVersion);
+        await Assert.That(initial).IsNotEqualTo(changedSaves);
+        await Assert.That(initial).IsNotEqualTo(changedSession);
+        await Assert.That(initial).IsNotEqualTo(changedCount);
+        foreach (var changed in new[] { changedVersion, changedSaves, changedSession, changedCount })
+        {
+            var token = tokens.Issue("save-document", "document-1", "path=A", initial);
+            await Assert.That(tokens.Consume(token, "save-document", "document-1", "path=A", changed))
+                .IsEqualTo(DocumentConfirmationResult.DocumentChanged);
+        }
+    }
+
+    [Test]
+    public async Task DocumentConfirmationBinding_Identity_NormalizesPathCaseAndTrailingSeparators()
+    {
+        var first = DocumentConfirmationBinding.Identity(@"C:\Models\Tower.rvt\", "Tower.rvt");
+        var second = DocumentConfirmationBinding.Identity(@"c:\models\tower.rvt", "Tower.rvt");
+        await Assert.That(first).IsEqualTo(second);
+    }
+
+    [Test]
+    public async Task DocumentConfirmationBinding_Arguments_ChangesWhenBusinessFieldChanges()
+    {
+        var action = new ActionJobContract { Document = "Tower", Save = true };
+        var baseline = DocumentConfirmationBinding.Arguments(action, @"C:\Models\Tower.rvt", isModified: true);
+        action.Save = false;
+        var changed = DocumentConfirmationBinding.Arguments(action, @"C:\Models\Tower.rvt", isModified: true);
+        await Assert.That(baseline).IsNotEqualTo(changed);
+    }
+
+    [Test]
+    public async Task DocumentPaths_RejectCloudAndMalformedServerPaths()
+    {
+        DocumentPathValidator.Validate("RSN://server/folder/model.rvt");
+        DocumentPathValidator.Validate(@"C:\models\file.rvt");
+        DocumentPathValidator.Validate(@"C:\models\family.rfa");
+        foreach (var path in new[] { "RSN://server/model.rvt", "RSN://server//model.rvt", "BIM360://hub/model.rvt", "relative.rvt" })
+            await Assert.That(() => DocumentPathValidator.Validate(path)).Throws<ArgumentException>();
+    }
+
+    [Test]
+    public async Task DocumentActions_ValidateModesWorksetsAndSyncComment()
+    {
+        await Assert.That(ControlJobParser.Parse("""{"command":"open-document","path":"RSN://server/folder/model.rvt"}""").Kind).IsEqualTo(ControlJobKind.Action);
+        await Assert.That(ControlJobParser.Parse("""{"command":"open-document","path":"C:\\x\\a.rvt","worksets":"open","worksetsOpen":["A"]}""").Kind).IsEqualTo(ControlJobKind.Action);
+        var sync = ControlJobParser.Parse("""{"command":"sync-document","document":"A","comment":"grids","relinquish":"custom","relinquishFlags":{"borrowed":true}}""");
+        await Assert.That(sync.Kind).IsEqualTo(ControlJobKind.Action);
+        await Assert.That(sync.Action!.RelinquishFlags!["borrowed"]).IsTrue();
+        foreach (var json in new[]
+        {
+            """{"command":"open-document","path":"C:\\x\\a.rvt","mode":"central"}""",
+            """{"command":"open-document","path":"C:\\x\\a.rvt","worksets":"bad"}""",
+            """{"command":"sync-document","document":"A"}""",
+            """{"command":"save-document","document":"C:\\x\\a.rvt","saveAs":"C:\\x\\a.rvt"}"""
+        })
+            await Assert.That(ControlJobParser.Parse(json).Kind).IsEqualTo(ControlJobKind.Invalid);
+        await Assert.That(ControlJobParser.Parse("""{"command":"batch","steps":[{"command":"save-document","document":"A"}]}""").Kind)
+            .IsEqualTo(ControlJobKind.Invalid);
+    }
+
+    [Test]
+    public async Task Documents_UsesReadRoutingWithoutAnActiveDocument()
+    {
+        var parsed = ControlJobParser.Parse("""{"command":"documents"}""");
+        await Assert.That(parsed.Kind).IsEqualTo(ControlJobKind.Documents);
+        await Assert.That(ActionJobParser.IsAction("documents")).IsFalse();
+    }
+
+    [Test]
+    public async Task Parse_NwcDefaultsMatchExporterDefaults()
+    {
+        var result = ControlJobParser.Parse("""{"command":"export-nwc","path":"C:\\x\\a.nwc"}""");
+        await Assert.That(result.Kind).IsEqualTo(ControlJobKind.Action);
+        var options = result.Action!.Nwc;
+        await Assert.That(options.Scope).IsEqualTo("model");
+        await Assert.That(options.Coordinates).IsEqualTo("shared");
+        await Assert.That(options.Parameters).IsEqualTo("all");
+        await Assert.That(options.ExportElementIds).IsTrue();
+        await Assert.That(options.ConvertElementProperties).IsFalse();
+        await Assert.That(options.ExportParts).IsFalse();
+        await Assert.That(options.ExportRoomAsAttribute).IsTrue();
+        await Assert.That(options.ExportRoomGeometry).IsTrue();
+        await Assert.That(options.ConvertLights).IsFalse();
+        await Assert.That(options.ConvertLinkedCadFormats).IsTrue();
+        await Assert.That(options.ExportLinks).IsFalse();
+        await Assert.That(options.ExportUrls).IsTrue();
+        await Assert.That(options.DivideFileIntoLevels).IsTrue();
+        await Assert.That(options.FindMissingMaterials).IsTrue();
+        await Assert.That(options.FacetingFactor).IsEqualTo(1);
+        await Assert.That(options.Overwrite).IsFalse();
+    }
+
+    [Test]
+    public async Task Parse_NwcAcceptsParameterOverrideAndSelection()
+    {
+        var result = ControlJobParser.Parse("""{"command":"export-nwc","path":"C:\\x\\a.nwc","scope":"selection","elementIds":[1,2],"parameters":"none","facetingFactor":5,"overwrite":true}""");
+        await Assert.That(result.Kind).IsEqualTo(ControlJobKind.Action);
+        await Assert.That(result.Action!.Nwc.Parameters).IsEqualTo("none");
+        await Assert.That(result.Action.Nwc.FacetingFactor).IsEqualTo(5);
+        await Assert.That(result.Action.Nwc.Overwrite).IsTrue();
+        await Assert.That(result.Action.ElementIds).IsEquivalentTo(new long[] { 1, 2 });
+    }
+
+    [Test]
+    public async Task Parse_NwcRejectsNonStringParameters()
+    {
+        var result = ControlJobParser.Parse("""{"command":"export-nwc","path":"C:\\x\\a.nwc","parameters":["none"]}""");
+        await Assert.That(result.Kind).IsEqualTo(ControlJobKind.Invalid);
+        await Assert.That(result.Cause).IsNull();
+    }
+
+    [Test]
+    public async Task Serialize_NwcResponse_UsesSnakeCaseOptions()
+    {
+        var data = new ActionResultData
+        {
+            Path = @"C:\x\a.nwc",
+            Scope = "model",
+            DryRun = true,
+            Overwritten = false,
+            Options = new NwcOptionsResult { Scope = "model", Coordinates = "shared", Parameters = "all", FacetingFactor = 1 }
+        };
+        var json = CommandResponseJsonSerializer.Serialize(CommandResponse<ActionResultData>.Ok("export-nwc", data, 1));
+        await Assert.That(json).Contains("\"export_element_ids\":false");
+        await Assert.That(json).Contains("\"faceting_factor\":1");
+        await Assert.That(json).Contains("\"view\":null");
+    }
+
+    [Test]
+    [Arguments("\"scope\":\"view\"")]
+    [Arguments("\"scope\":\"selection\",\"elementIds\":[]")]
+    [Arguments("\"coordinates\":\"unknown\"")]
+    [Arguments("\"parameters\":\"unknown\"")]
+    [Arguments("\"facetingFactor\":0")]
+    [Arguments("\"facetingFactor\":101")]
+    public async Task Parse_NwcRejectsInvalidOptions(string fields)
+    {
+        var result = ControlJobParser.Parse($$"""{"command":"export-nwc","path":"C:\\x\\a.nwc",{{fields}}}""");
+        await Assert.That(result.Kind).IsEqualTo(ControlJobKind.Invalid);
+    }
+
+    [Test]
+    public async Task Parse_BatchRejectsNwcExport()
+    {
+        var result = ControlJobParser.Parse("""{"command":"batch","steps":[{"command":"export-nwc","path":"C:\\x\\a.nwc"}]}""");
+        await Assert.That(result.Kind).IsEqualTo(ControlJobKind.Invalid);
+    }
+
+    [Test]
+    [Arguments("""{"command":"edit-families","operations":[]}""")]
+    [Arguments("""{"command":"edit-families","operations":[{"op":"unknown"}]}""")]
+    [Arguments("""{"command":"edit-families","operations":[{"op":"remove_parameters","names":[]}]}""")]
+    [Arguments("""{"command":"batch","steps":[{"command":"edit-families","operations":[{"op":"purge"}]}]}""")]
+    public async Task Parse_InvalidFamilyEdits_AreRejected(string json)
+    {
+        await Assert.That(ControlJobParser.Parse(json).Kind).IsEqualTo(ControlJobKind.Invalid);
+    }
+
+    [Test]
+    public async Task Parse_FamilyWildcardAndDefaults()
+    {
+        var result = ControlJobParser.Parse("""{"command":"edit-families","families":["*"],"operations":[{"op":"purge"}]}""");
+        await Assert.That(result.Kind).IsEqualTo(ControlJobKind.Action);
+        await Assert.That(result.Action!.Families).IsEquivalentTo(new[] { "*" });
+        await Assert.That(result.Action.StopOnError).IsTrue();
+        await Assert.That(result.Action.OverwriteParameterValues).IsFalse();
+    }
+
+    [Test]
+    public async Task Parse_SharedParameterInstanceDefaultsToTrue()
+    {
+        var result = ControlJobParser.Parse("""{"command":"edit-families","operations":[{"op":"add_shared_parameters","parameters":[{"name":"AssetId","group":"Data"}]}]}""");
+        await Assert.That(result.Kind).IsEqualTo(ControlJobKind.Action);
+        await Assert.That(result.Action!.Operations[0].Parameters![0].Instance).IsTrue();
+
+        var explicitType = ControlJobParser.Parse("""{"command":"edit-families","operations":[{"op":"add_shared_parameters","parameters":[{"name":"AssetId","group":"Data","instance":false}]}]}""");
+        await Assert.That(explicitType.Action!.Operations[0].Parameters![0].Instance).IsFalse();
+    }
+
+    [Test]
+    public async Task Parse_FamilyAudit_UsesReadRoutingAndKeepsAddressedDocument()
+    {
+        var result = ControlJobParser.Parse("""{"command":"family-audit","families":["Door"],"targetDocument":"Model"}""");
+        await Assert.That(result.Kind).IsEqualTo(ControlJobKind.FamilyAudit);
+        await Assert.That(ActionJobParser.IsAction(result.Command)).IsFalse();
+        await Assert.That(result.CoordinatorJob.TargetDocument).IsEqualTo("Model");
+        await Assert.That(result.TargetDocument).IsNull();
+        await Assert.That(result.Action!.Families).IsEquivalentTo(new[] { "Door" });
+    }
+
+    [Test]
+    public async Task Parse_MoreThanTwoHundredFamilies_IsRejected()
+    {
+        var names = string.Join(",", Enumerable.Range(0, 201).Select(index => $"\"Family {index}\""));
+        var result = ControlJobParser.Parse($$"""{"command":"family-audit","families":[{{names}}]}""");
+        await Assert.That(result.Kind).IsEqualTo(ControlJobKind.Invalid);
+    }
+
+    [Test]
+    public async Task ValidateFamilyMode_RequiresNamesOnlyForProject()
+    {
+        var action = new ActionJobContract();
+        await Assert.That(() => ActionJobParser.ValidateFamilyMode(action, false)).Throws<ArgumentException>();
+        ActionJobParser.ValidateFamilyMode(action, true);
+        action.Families = ["*"];
+        ActionJobParser.ValidateFamilyMode(action, false);
+        await Assert.That(() => ActionJobParser.ValidateFamilyMode(action, true)).Throws<ArgumentException>();
+    }
+
+    [Test]
+    public async Task Parse_AlignLinkDatums_UsesDefaultsAndRejectsBatchStep()
+    {
+        var parsed = ControlJobParser.Parse("""{"command":"align-link-datums","link":"AR.rvt : 1"}""");
+        await Assert.That(parsed.Kind).IsEqualTo(ControlJobKind.Action);
+        await Assert.That(parsed.Action!.DatumOptions!.Kinds).IsEquivalentTo(new[] { "grids", "levels" });
+        await Assert.That(parsed.Action.DatumOptions.ToleranceMm).IsEqualTo(0.5);
+        await Assert.That(parsed.Action.DatumOptions.CreateMissing).IsTrue();
+        var mapped = ControlJobParser.Parse("""{"command":"align-link-datums","link":"AR.rvt","nameMap":{"A":"Host A"}}""");
+        await Assert.That(mapped.Kind).IsEqualTo(ControlJobKind.Action);
+        await Assert.That(mapped.Action!.DatumOptions!.NameMap["A"]).IsEqualTo("Host A");
+        var batch = ControlJobParser.Parse("""{"command":"batch","steps":[{"command":"align-link-datums","link":"AR.rvt"}]}""");
+        await Assert.That(batch.Kind).IsEqualTo(ControlJobKind.Invalid);
+    }
+
+    [Test]
+    public async Task Parse_AlignLinkDatums_RejectsInvalidOptions()
+    {
+        foreach (var payload in new[]
+        {
+            """{"command":"align-link-datums"}""",
+            """{"command":"align-link-datums","link":"A","kinds":["walls"]}""",
+            """{"command":"align-link-datums","link":"A","toleranceMm":0}"""
+        })
+            await Assert.That(ControlJobParser.Parse(payload).Kind).IsEqualTo(ControlJobKind.Invalid);
+    }
+
+    [Test]
     [Arguments("select")]
     [Arguments("show")]
     [Arguments("isolate")]
@@ -248,5 +547,55 @@ public sealed class ActionJobParserTests
         var steps = string.Join(",", Enumerable.Repeat("""{"command":"select","elementIds":[]}""", count));
         var result = ControlJobParser.Parse($$"""{"command":"batch","steps":[{{steps}}]}""");
         await Assert.That(result.Kind).IsEqualTo(expected);
+    }
+
+    [Test]
+    public async Task WorksetMask_MatchesGlobAndRegexIgnoringCase()
+    {
+        await Assert.That(WorksetMask.Matches("HVAC Supply", "hvac*")).IsTrue();
+        await Assert.That(WorksetMask.Matches("HVAC Supply", "regex:^hvac\\s+sup")).IsTrue();
+        await Assert.That(WorksetMask.Matches("Structure", "hvac*")).IsFalse();
+    }
+
+    [Test]
+    public async Task Parse_ViewVisibilityValidatesTemplateModeAndMasks()
+    {
+        var visibility = ControlJobParser.Parse("""{"command":"set-view-visibility","view":"3D","worksets":{"hideMask":["HVAC*"]}}""");
+        await Assert.That(visibility.Kind).IsEqualTo(ControlJobKind.Action);
+        await Assert.That(visibility.Action!.Visibility!.Worksets.HideMask).IsEquivalentTo(new[] { "HVAC*" });
+        await Assert.That(ControlJobParser.Parse("""{"command":"set-view-visibility","view":"3D","categoryClasses":{"model":true},"templateMode":"detach"}""").Kind)
+            .IsEqualTo(ControlJobKind.Action);
+        await Assert.That(ControlJobParser.Parse("""{"command":"set-view-visibility","view":"3D","categoryClasses":{"model":true},"templateMode":"edit_all"}""").Kind)
+            .IsEqualTo(ControlJobKind.Invalid);
+        await Assert.That(ControlJobParser.Parse("""{"command":"set-view-visibility","view":"3D","worksets":{"hideMask":["regex:["]}}""").Kind)
+            .IsEqualTo(ControlJobKind.Invalid);
+    }
+
+    [Test]
+    public async Task CategoryTypeExpansion_ExpandsOnlyRequestedTypes()
+    {
+        var categories = new[] { ("Walls", "model"), ("Text", "annotation"), ("Imports", "import") };
+        await Assert.That(CategoryTypeExpansion.Expand(["annotation", "import"], categories))
+            .IsEquivalentTo(new[] { "Text", "Imports" });
+    }
+
+    [Test]
+    public async Task Parse_RemoveLinksValidatesKinds()
+    {
+        await Assert.That(ControlJobParser.Parse("""{"command":"remove-links","links":["*"],"kinds":["revit","image"]}""").Kind)
+            .IsEqualTo(ControlJobKind.Action);
+        await Assert.That(ControlJobParser.Parse("""{"command":"remove-links","links":["*"],"kinds":["unknown"]}""").Kind)
+            .IsEqualTo(ControlJobKind.Invalid);
+    }
+
+    [Test]
+    public async Task Parse_BatchRejectsViewVisibilityAndLinkRemovalSteps()
+    {
+        var visibilityBatch = ControlJobParser.Parse(
+            """{"command":"batch","steps":[{"command":"set-view-visibility","view":"3D","categoryClasses":{"model":true}}]}""");
+        await Assert.That(visibilityBatch.Kind).IsEqualTo(ControlJobKind.Invalid);
+        var linkRemovalBatch = ControlJobParser.Parse(
+            """{"command":"batch","steps":[{"command":"remove-links","links":["*"]}]}""");
+        await Assert.That(linkRemovalBatch.Kind).IsEqualTo(ControlJobKind.Invalid);
     }
 }

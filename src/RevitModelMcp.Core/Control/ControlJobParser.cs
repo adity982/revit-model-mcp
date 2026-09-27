@@ -1,6 +1,7 @@
 using System.Runtime.Serialization;
 using System.Runtime.Serialization.Json;
 using System.Text;
+using System.Text.RegularExpressions;
 using RevitModelMcp.Core.Models;
 
 namespace RevitModelMcp.Core.Control;
@@ -11,12 +12,14 @@ public enum ControlJobKind
     ViewsDump,
     Ping,
     DocumentInfo,
+    Documents,
     ModelHealth,
     LinksStatus,
     SharedCoordinates,
     ParameterFillCheck,
     ListViews,
     ViewSummary,
+    ViewInfo,
     ViewElements,
     ElementDetails,
     ViewWarnings,
@@ -26,8 +29,12 @@ public enum ControlJobKind
     ListCatalog,
     ListWarnings,
     ListRelations,
+    FamilyAudit,
     Action,
-    Invalid
+    NwcSettingsCheck,
+    Invalid,
+    CompareLinkDatums,
+    Jobs
 }
 
 public sealed class ControlJobParseResult
@@ -43,6 +50,10 @@ public sealed class ControlJobParseResult
     public ControlJobKind Kind { get; }
     public string Command { get; }
     public string? CorrelationId { get; internal set; }
+    public string? JobId { get; internal set; }
+    public string ClientId { get; internal set; } = "unknown";
+    public string ClientName { get; internal set; } = "unknown";
+    public string? CancelJobId { get; internal set; }
     public IReadOnlyList<string> Views { get; internal set; } = Array.Empty<string>();
     public string? View { get; internal set; }
     public string? ViewType { get; internal set; }
@@ -67,6 +78,7 @@ public sealed class ControlJobParseResult
     public bool ZoomToFit { get; internal set; } = true;
     public string? TargetDocument { get; internal set; }
     public int? TargetProcessId { get; internal set; }
+    public bool IncludeLinked { get; internal set; }
     public ActionJobContract? Action { get; internal set; }
     public string? Error { get; }
     public Exception? Cause { get; }
@@ -95,6 +107,13 @@ public sealed class ControlJobParseResult
     {
         var result = Create(kind, command);
         result.View = view;
+        return result;
+    }
+
+    private static ControlJobParseResult Documents(bool includeLinked)
+    {
+        var result = Create(ControlJobKind.Documents, "documents");
+        result.IncludeLinked = includeLinked;
         return result;
     }
 
@@ -145,7 +164,9 @@ public sealed class ControlJobParseResult
         {
             return new ControlJobParseResult(ControlJobKind.Invalid, "invalid", "The command field is required.")
             {
-                CorrelationId = job.CorrelationId
+                CorrelationId = job.CorrelationId,
+                ClientId = string.IsNullOrWhiteSpace(job.ClientId) ? "unknown" : job.ClientId!,
+                ClientName = string.IsNullOrWhiteSpace(job.ClientName) ? "unknown" : job.ClientName!
             };
         }
 
@@ -157,13 +178,16 @@ public sealed class ControlJobParseResult
             "views-dump" when views.Count == 0 => Invalid(command, "The views-dump command requires a non-empty views list."),
             "views-dump" => ViewsDump(views),
             "ping" => Create(ControlJobKind.Ping, command),
+            "jobs" => Create(ControlJobKind.Jobs, command),
             "model-health" => Create(ControlJobKind.ModelHealth, command),
             "links-status" => Create(ControlJobKind.LinksStatus, command),
             "shared-coordinates" => Create(ControlJobKind.SharedCoordinates, command),
             "parameter-fill-check" => ParseParameterFill(job),
             "document-info" => Create(ControlJobKind.DocumentInfo, command),
+            "documents" => Documents(job.IncludeLinked ?? false),
             "list-views" => ListViews(job.ViewType, job.NameContains),
             "view-summary" => RequireView(ControlJobKind.ViewSummary, command, view),
+            "view-info" => RequireView(ControlJobKind.ViewInfo, command, view),
             "view-elements" => ParseViewElements(command, view, categories, job.Offset, job.Limit),
             "element-details" => ParseElementDetails(command, job.Id),
             "view-warnings" => RequireView(ControlJobKind.ViewWarnings, command, view),
@@ -173,14 +197,48 @@ public sealed class ControlJobParseResult
             "list-catalog" => UniversalJobParser.ParseCatalog(job),
             "list-warnings" => UniversalJobParser.ParseWarnings(job),
             "list-relations" => UniversalJobParser.ParseRelations(job),
+            "family-audit" => ParseFamilyAudit(job),
+            "nwc-settings-check" => string.IsNullOrWhiteSpace(job.SettingsXml)
+                ? Invalid(command, "settingsXml is required.")
+                : Create(ControlJobKind.NwcSettingsCheck, command),
+            "compare-link-datums" => ParseCompareLinkDatums(job),
             _ when ActionJobParser.IsAction(command) => ActionJobParser.Parse(command, job),
             _ => Invalid(command, $"Unknown command: {command}.")
         };
         result.CorrelationId = job.CorrelationId;
+        result.JobId = job.JobId;
+        result.ClientId = string.IsNullOrWhiteSpace(job.ClientId) ? "unknown" : job.ClientId!;
+        result.ClientName = string.IsNullOrWhiteSpace(job.ClientName) ? "unknown" : job.ClientName!;
+        result.CancelJobId = job.CancelJobId;
         result.CoordinatorJob.CorrelationId = job.CorrelationId;
-        result.TargetDocument = Normalize(job.TargetDocument);
+        if (command is "family-audit" or "nwc-settings-check") result.CoordinatorJob = job;
+        result.TargetDocument = command == "family-audit" ? null : Normalize(job.TargetDocument);
         result.TargetProcessId = job.TargetProcessId;
         return result;
+    }
+
+    private static ControlJobParseResult ParseFamilyAudit(ControlJobContract job)
+    {
+        var parsed = ActionJobParser.Parse("family-audit", job);
+        if (parsed.Error is not null) return parsed;
+        var result = ControlJobParseResult.Create(ControlJobKind.FamilyAudit, "family-audit");
+        result.Action = parsed.Action;
+        return result;
+    }
+
+    private static ControlJobParseResult ParseCompareLinkDatums(ControlJobContract job)
+    {
+        const string command = "compare-link-datums";
+        try
+        {
+            var result = Create(ControlJobKind.CompareLinkDatums, command);
+            result.Action = new ActionJobContract { DatumOptions = ActionJobParser.ParseDatumOptions(job) };
+            return result;
+        }
+        catch (ArgumentException exception)
+        {
+            return Invalid(command, exception.Message);
+        }
     }
 
     private static ControlJobParseResult ParseParameterFill(ControlJobContract job)
@@ -286,9 +344,15 @@ public static class ControlJobParser
             return ControlJobParseResult.LegacySnapshot();
         }
 
+        var isNwcExport = Regex.IsMatch(content, "\"command\"\\s*:\\s*\"export-nwc\"");
         try
         {
-            var serializer = new DataContractJsonSerializer(typeof(ControlJobContract));
+            if (isNwcExport)
+                content = Regex.Replace(content, "\"parameters\"(?=\\s*:)", "\"nwcParameters\"");
+            if (Regex.IsMatch(content, "\"command\"\\s*:\\s*\"set-view-visibility\""))
+                content = Regex.Replace(content, "\"worksets\"(?=\\s*:)", "\"visibilityWorksets\"");
+            var serializer = new DataContractJsonSerializer(typeof(ControlJobContract),
+                new DataContractJsonSerializerSettings { UseSimpleDictionaryFormat = true });
             using var stream = new MemoryStream(Encoding.UTF8.GetBytes(content));
             var job = serializer.ReadObject(stream) as ControlJobContract;
             return job is null
@@ -299,15 +363,15 @@ public static class ControlJobParser
         {
             var result = ControlJobParseResult.Invalid(
                 "invalid",
-                $"Failed to parse the job JSON: {exception.Message}",
-                exception);
+                isNwcExport ? "Failed to parse the export-nwc job JSON." : $"Failed to parse the job JSON: {exception.Message}",
+                isNwcExport ? null : exception);
             try
             {
                 using var stream = new MemoryStream(Encoding.UTF8.GetBytes(content));
                 var envelope = new DataContractJsonSerializer(typeof(JobEnvelope)).ReadObject(stream) as JobEnvelope;
                 if (envelope is not null)
                 {
-                    result = ControlJobParseResult.Invalid(envelope.Command ?? "invalid", result.Error!, exception);
+                    result = ControlJobParseResult.Invalid(envelope.Command ?? "invalid", result.Error!, isNwcExport ? null : exception);
                     result.CorrelationId = envelope.CorrelationId;
                 }
             }
@@ -333,6 +397,14 @@ public static class ControlJobParser
 [DataContract]
 public sealed partial class ControlJobContract
 {
+    [DataMember(Name = "jobId", EmitDefaultValue = false)]
+    public string? JobId { get; set; }
+    [DataMember(Name = "clientId", EmitDefaultValue = false)]
+    public string? ClientId { get; set; }
+    [DataMember(Name = "clientName", EmitDefaultValue = false)]
+    public string? ClientName { get; set; }
+    [DataMember(Name = "cancelJobId", EmitDefaultValue = false)]
+    public string? CancelJobId { get; set; }
     [DataMember(Name = "correlationId", EmitDefaultValue = false)]
     public string? CorrelationId { get; set; }
     [DataMember(Name = "parameters", EmitDefaultValue = false)]
@@ -403,6 +475,8 @@ public sealed partial class ControlJobContract
     public string? TargetDocument { get; set; }
     [DataMember(Name = "targetProcessId")]
     public int? TargetProcessId { get; set; }
+    [DataMember(Name = "includeLinked")]
+    public bool? IncludeLinked { get; set; }
 }
 
 [DataContract]

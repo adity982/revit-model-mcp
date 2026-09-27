@@ -109,7 +109,7 @@ internal sealed class HttpChannel : IDisposable
                     ["documentName"] = _documentName,
                     ["processId"] = _processId,
                     ["startedUtc"] = SnapshotFileWriter.StartedUtc,
-                    ["readOnly"] = !ActionCommandExecutor.ActionsEnabled
+                    ["readOnly"] = ActionCommandExecutor.ReadOnlyMode
                 }).ConfigureAwait(false);
                 return;
             }
@@ -127,7 +127,21 @@ internal sealed class HttpChannel : IDisposable
                     await JsonAsync(context, 404, new() { ["error"] = "Job not found or expired." }).ConfigureAwait(false);
                     return;
                 }
-                await SendJobAsync(context, existing, 0).ConfigureAwait(false);
+                await SendStatusAsync(context, existing, 0).ConfigureAwait(false);
+                return;
+            }
+            if (method == "POST" && path.StartsWith("/jobs/", StringComparison.Ordinal) && path.EndsWith("/cancel", StringComparison.Ordinal))
+            {
+                var jobId = path.Substring(6, path.Length - 13);
+                using var reader = new StreamReader(context.Request.InputStream, Encoding.UTF8);
+                var request = ControlJobParser.Parse(await reader.ReadToEndAsync().ConfigureAwait(false));
+                var cancellation = _channel.CancelJob(jobId, request.ClientId);
+                await JsonAsync(context, cancellation.State is null ? 404 : 200, new()
+                {
+                    ["cancelled"] = cancellation.Cancelled,
+                    ["state"] = cancellation.State is null ? "unknown" : ControlChannel.StateName(cancellation.State.Value),
+                    ["message"] = cancellation.Message
+                }).ConfigureAwait(false);
                 return;
             }
             if (method == "POST" && path == "/jobs")
@@ -146,8 +160,9 @@ internal sealed class HttpChannel : IDisposable
                     }
                     body.Write(buffer, 0, read);
                 }
-                var job = await SubmitAsync(context, ControlJobParser.Parse(Encoding.UTF8.GetString(body.ToArray()))).ConfigureAwait(false);
-                if (job is not null) await SendJobAsync(context, job, timeout).ConfigureAwait(false);
+                var payload = Encoding.UTF8.GetString(body.ToArray());
+                var job = await SubmitAsync(context, ControlJobParser.Parse(payload), payload).ConfigureAwait(false);
+                if (job is not null) await SendStatusAsync(context, job, timeout).ConfigureAwait(false);
                 return;
             }
             if (method == "GET" && path.StartsWith("/views/", StringComparison.Ordinal) && path.EndsWith("/image", StringComparison.Ordinal))
@@ -182,7 +197,8 @@ internal sealed class HttpChannel : IDisposable
                 }
                 else
                 {
-                    job = await SubmitAsync(context, ControlJobParser.Parse(HttpSettings.Serialize(payload))).ConfigureAwait(false);
+                    var serialized = HttpSettings.Serialize(payload);
+                    job = await SubmitAsync(context, ControlJobParser.Parse(serialized), serialized).ConfigureAwait(false);
                 }
                 if (job is null) return;
                 if (!await WaitAsync(job, 120).ConfigureAwait(false))
@@ -251,19 +267,24 @@ internal sealed class HttpChannel : IDisposable
         return false;
     }
 
-    private async Task<HttpJob?> SubmitAsync(HttpListenerContext context, ControlJobParseResult command)
+    private async Task<HttpJob?> SubmitAsync(HttpListenerContext context, ControlJobParseResult command, string payload)
     {
-        if (ActionJobParser.IsAction(command.Command) && !ActionCommandExecutor.ActionsEnabled)
+        if (ActionJobParser.IsAction(command.Command) && ActionCommandExecutor.ReadOnlyMode)
         {
-            await JsonAsync(context, 403, new() { ["error"] = "actions disabled on the workstation", ["correlationId"] = command.CorrelationId ?? string.Empty }).ConfigureAwait(false);
+            await JsonAsync(context, 403, new() { ["error"] = "read-only mode", ["correlationId"] = command.CorrelationId ?? string.Empty }).ConfigureAwait(false);
             return null;
         }
-        if (!_channel.TrySubmit(command, out var completion))
+        var submitted = _channel.SubmitHttp(command, payload, out var completion);
+        if (submitted.Job is null)
         {
-            await JsonAsync(context, 409, new() { ["error"] = "The add-in is busy with another command.", ["correlationId"] = command.CorrelationId ?? string.Empty }).ConfigureAwait(false);
+            await JsonAsync(context, submitted.Error == "queue_full" ? 429 : 400, new()
+            {
+                ["error"] = submitted.Error ?? "submission_failed",
+                ["retryAfterMs"] = submitted.RetryAfterMs
+            }).ConfigureAwait(false);
             return null;
         }
-        var job = new HttpJob(Guid.NewGuid().ToString("N"), command, completion!);
+        var job = new HttpJob(submitted.Job.JobId, command, completion!);
         _jobs[job.Id] = job;
         _ = MarkCompletedAsync(job);
         _requestExecution();
@@ -286,13 +307,28 @@ internal sealed class HttpChannel : IDisposable
         return completed;
     }
 
-    private async Task SendJobAsync(HttpListenerContext context, HttpJob job, int seconds)
+    private async Task SendStatusAsync(HttpListenerContext context, HttpJob job, int seconds)
     {
         context.Response.Headers["X-Revit-Job-Id"] = job.Id;
-        if (await WaitAsync(job, seconds).ConfigureAwait(false))
-            await BytesAsync(context, 200, Encoding.UTF8.GetBytes(await job.Completion.ConfigureAwait(false)), "application/json").ConfigureAwait(false);
-        else
-            await JsonAsync(context, 202, new() { ["jobId"] = job.Id, ["correlationId"] = job.Command.CorrelationId ?? string.Empty }).ConfigureAwait(false);
+        await WaitAsync(job, seconds).ConfigureAwait(false);
+        var status = _channel.Scheduler.Status(job.Id);
+        if (status is null)
+        {
+            await JsonAsync(context, 404, new() { ["error"] = "Job not found or expired." }).ConfigureAwait(false);
+            return;
+        }
+        var result = new Dictionary<string, object>
+        {
+            ["jobId"] = status.JobId,
+            ["state"] = ControlChannel.StateName(status.State),
+            ["position"] = status.Position,
+            ["correlationId"] = job.Command.CorrelationId ?? string.Empty
+        };
+        var json = HttpSettings.Serialize(result);
+        if (status.Result is not null)
+            json = json.Substring(0, json.Length - 1) + ",\"result\":" + status.Result + "}";
+        await BytesAsync(context, status.Result is null ? 202 : 200,
+            Encoding.UTF8.GetBytes(json), "application/json").ConfigureAwait(false);
     }
 
     private void RemoveExpiredResults()
@@ -347,6 +383,7 @@ internal sealed record HttpSettings
     [DataMember(Name = "httpBind", Order = 2)] public string HttpBind { get; set; } = "127.0.0.1";
     [DataMember(Name = "httpPort", Order = 3)] public int HttpPort { get; set; } = 53110;
     [DataMember(Name = "token", Order = 4)] public string Token { get; set; } = string.Empty;
+    [DataMember(Name = "showActivityPaneOnAction", Order = 5)] public bool ShowActivityPaneOnAction { get; set; } = true;
 
     [OnDeserializing]
     private void SetDefaults(StreamingContext context)
@@ -355,6 +392,7 @@ internal sealed record HttpSettings
         HttpBind = "127.0.0.1";
         HttpPort = 53110;
         Token = string.Empty;
+        ShowActivityPaneOnAction = true;
     }
 
     public static HttpSettings Load(string? directory = null)

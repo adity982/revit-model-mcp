@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import os
-from pathlib import PureWindowsPath
 from typing import Annotated, Any
 
 from mcp.server import MCPServer
@@ -11,8 +10,9 @@ from mcp.types import ToolAnnotations
 from pydantic import AliasChoices, Field
 
 from revit_model_mcp import package_version
-from revit_model_mcp.actions import env_flag, register_actions
+from revit_model_mcp.actions import env_flag, redact_model_paths, register_actions
 from revit_model_mcp.http_host import HttpHost
+from revit_model_mcp.pipe_host import LocalPipeHost
 from revit_model_mcp.revit_channel import (
     CHANNEL_DIRECTORY,
     DEFAULT_HOST,
@@ -21,15 +21,19 @@ from revit_model_mcp.revit_channel import (
     ReadJob,
     RevitChannelError,
     RevitReadChannel,
+    with_client_identity,
 )
 from revit_model_mcp.ssh_host import SshPowerShellHost
 
 
-def create_host(value: str, token: str | None = None) -> SshPowerShellHost | HttpHost:
+def create_host(
+    value: str, token: str | None = None
+) -> LocalPipeHost | SshPowerShellHost | HttpHost:
     if value.startswith(("http://", "https://")):
         return HttpHost(value, token)
     if value == "local":
-        return SshPowerShellHost("local", local=True)
+        # Named pipe when the add-in advertises pipe/1, otherwise the local file channel.
+        return LocalPipeHost(SshPowerShellHost("local", local=True))
     if value.startswith("ssh:") and value[4:]:
         return SshPowerShellHost(value[4:])
     raise ValueError(
@@ -39,22 +43,6 @@ def create_host(value: str, token: str | None = None) -> SshPowerShellHost | Htt
 
 host = create_host(os.environ.get("REVIT_MCP_HOST", DEFAULT_HOST))
 channel = RevitReadChannel(host)
-
-
-def redact_model_paths(value: Any) -> Any:
-    if not env_flag("REVIT_MCP_REDACT_PATHS", False):
-        return value
-    if isinstance(value, dict):
-        return {
-            key: PureWindowsPath(item).name
-            if key in {"documentPath", "path"} and isinstance(item, str)
-            else redact_model_paths(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, list):
-        return [redact_model_paths(item) for item in value]
-    return value
-
 
 READ_ONLY_TOOL = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True)
 TimeoutSeconds = Annotated[
@@ -218,9 +206,16 @@ mcp = MCPServer(
     "Revit Model Reader",
     version=package_version(),
     instructions=(
-        "Read-only by default. Actions are a separate tool set you enable on purpose. "
-        "For universal model analysis, call revit_list_catalog first, "
-        "revit_aggregate_elements second, and revit_query_elements only when rows are needed."
+        "Actions are enabled by default: every change runs inside a single named Revit undo entry, is "
+        "listed in the add-in's MCP activity pane, and comes back with a `summary` sentence and the "
+        "changed element IDs. Before running an action, describe it to the user. After it runs, relay "
+        "`summary` and the changed element IDs to the user. Only the last action can be undone, with "
+        "revit_undo_last, and only while it is still the most recent change in Revit. Never call a "
+        "save, sync, or close-with-loss tool without the user's explicit confirmation in chat. Set "
+        "REVIT_MCP_READ_ONLY=1 in this server's environment, or add the workstation read-only file, to "
+        "disable actions without hiding them; they then return `read-only mode` instead of running. "
+        "For universal model analysis, call revit_list_catalog first, revit_aggregate_elements second, "
+        "and revit_query_elements only when rows are needed."
     ),
 )
 
@@ -247,12 +242,15 @@ def addressed_tool(function):
     )
     title = {
         "revit_ping": "Check Revit Connection",
+        "revit_jobs": "List Revit Jobs",
         "revit_document_info": "Document Info",
+        "revit_documents": "Open Documents",
         "revit_list_catalog": "List Catalog",
         "revit_aggregate_elements": "Aggregate Elements",
         "revit_query_elements": "Query Elements",
         "revit_list_views": "List Views",
         "revit_view_summary": "View Summary",
+        "revit_view_info": "View Info",
         "revit_export_view": "Export View to PNG",
         "revit_view_elements": "View Elements",
         "revit_element_details": "Element Details",
@@ -264,9 +262,68 @@ def addressed_tool(function):
         "revit_links_status": "Links Status",
         "revit_shared_coordinates": "Shared Coordinates",
         "revit_parameter_fill_check": "Parameter Fill Check",
+        "revit_family_audit": "Audit Families",
+        "revit_nwc_settings_check": "Check NWC Settings",
+        "revit_compare_link_datums": "Compare Link Datums",
     }[function.__name__]
     return mcp.tool(title=title, annotations=READ_ONLY_TOOL.model_copy(update={"title": title}))(
-        function
+        with_client_identity(function)
+    )
+
+
+@addressed_tool
+async def revit_jobs(
+    cancel_job_id: str | None = None,
+    timeout_seconds: TimeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    pickup_timeout_seconds: PickupTimeoutSeconds = DEFAULT_PICKUP_TIMEOUT_SECONDS,
+    document: Document = None,
+) -> dict[str, Any]:
+    """List queued and running jobs in the selected Revit process.
+
+    Supply cancel_job_id to cancel one of this server process's own jobs.
+    A running action finishes without interruption.
+    """
+    return await _execute(
+        ReadJob.jobs(cancel_job_id), timeout_seconds, pickup_timeout_seconds, document
+    )
+
+
+@addressed_tool
+async def revit_compare_link_datums(
+    link: str,
+    kinds: list[str] | None = None,
+    name_map: dict[str, str] | None = None,
+    prefix: str = "",
+    suffix: str = "",
+    level_offset_mm: float = 0,
+    reuse_matching: bool = True,
+    tolerance_mm: float = 0.5,
+    timeout_seconds: TimeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    pickup_timeout_seconds: PickupTimeoutSeconds = DEFAULT_PICKUP_TIMEOUT_SECONDS,
+    document: Document = None,
+) -> dict[str, Any]:
+    """Compare host grids and levels with one loaded Revit link. No model change is made.
+
+    A geometric match does not create a monitor relationship or later Coordination Review warnings.
+    """
+    return await _execute(
+        ReadJob(
+            "compare-link-datums",
+            {
+                "command": "compare-link-datums",
+                "link": link,
+                "kinds": kinds if kinds is not None else ["grids", "levels"],
+                "nameMap": name_map or {},
+                "prefix": prefix,
+                "suffix": suffix,
+                "levelOffsetMm": level_offset_mm,
+                "reuseMatching": reuse_matching,
+                "toleranceMm": tolerance_mm,
+            },
+        ),
+        timeout_seconds,
+        pickup_timeout_seconds,
+        document,
     )
 
 
@@ -285,6 +342,24 @@ async def revit_ping(
 
 
 @addressed_tool
+async def revit_nwc_settings_check(
+    settings_xml: str,
+    timeout_seconds: TimeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    pickup_timeout_seconds: PickupTimeoutSeconds = DEFAULT_PICKUP_TIMEOUT_SECONDS,
+    document: Document = None,
+) -> dict[str, Any]:
+    """Parse a Navisworks exporter XML file on the Revit workstation without exporting."""
+    return await _execute(
+        ReadJob(
+            "nwc-settings-check", {"command": "nwc-settings-check", "settingsXml": settings_xml}
+        ),
+        timeout_seconds,
+        pickup_timeout_seconds,
+        document,
+    )
+
+
+@addressed_tool
 async def revit_document_info(
     timeout_seconds: TimeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
     pickup_timeout_seconds: PickupTimeoutSeconds = DEFAULT_PICKUP_TIMEOUT_SECONDS,
@@ -299,6 +374,27 @@ async def revit_document_info(
     """
     return await _execute(
         ReadJob.document_info(), timeout_seconds, pickup_timeout_seconds, document
+    )
+
+
+@addressed_tool
+async def revit_documents(
+    include_linked: bool = False,
+    timeout_seconds: TimeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    pickup_timeout_seconds: PickupTimeoutSeconds = DEFAULT_PICKUP_TIMEOUT_SECONDS,
+    document: Document = None,
+) -> dict[str, Any]:
+    """List every open document in one Revit process, including background documents.
+
+    Linked documents are excluded unless include_linked is set. Returns title, path, isActive,
+    isLinked, isFamilyDocument, isWorkshared, isDetached, isModified, openedByMcp and centralPath
+    when available. An empty process returns [].
+    """
+    return await _execute(
+        ReadJob("documents", {"command": "documents", "includeLinked": include_linked}),
+        timeout_seconds,
+        pickup_timeout_seconds,
+        document,
     )
 
 
@@ -572,6 +668,19 @@ async def revit_list_views(
 
 
 @addressed_tool
+async def revit_view_info(
+    view: ViewName,
+    timeout_seconds: TimeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    pickup_timeout_seconds: PickupTimeoutSeconds = DEFAULT_PICKUP_TIMEOUT_SECONDS,
+    document: Document = None,
+) -> dict[str, Any]:
+    """Inspect one view's template, display, categories, worksets, filters and links."""
+    return await _execute(
+        ReadJob.view_info(view), timeout_seconds, pickup_timeout_seconds, document
+    )
+
+
+@addressed_tool
 async def revit_view_summary(
     view: ViewName,
     timeout_seconds: TimeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
@@ -743,6 +852,29 @@ async def revit_list_instances(document: Document = None) -> list[dict[str, obje
         raise ToolError(str(error)) from error
 
 
+@addressed_tool
+async def revit_family_audit(
+    families: Annotated[list[str] | None, Field(min_length=1, max_length=200)] = None,
+    response_timeout_s: Annotated[int, Field(ge=30, le=3600)] = 600,
+    document: Document = None,
+) -> dict[str, Any]:
+    """Audit an open family or named project families without saving or loading changes.
+
+    In project mode, pass exact names or ["*"]. In family mode, omit families.
+    Unused shared parameters may still carry schedule or tag data in the project.
+    """
+    if families is not None and (not families or any(not name.strip() for name in families)):
+        raise ToolError("families must contain 1 to 200 non-empty names.")
+    if families is not None and "*" in families and families != ["*"]:
+        raise ToolError("The '*' family selector must be alone.")
+    return await _execute(
+        ReadJob("family-audit", {"command": "family-audit", "families": families}),
+        response_timeout_s,
+        DEFAULT_PICKUP_TIMEOUT_SECONDS,
+        document,
+    )
+
+
 register_actions(mcp, _execute, lambda: host)
 
 
@@ -762,7 +894,10 @@ def main() -> None:
     parser.add_argument(
         "--host",
         default=default_host,
-        help="local, ssh:<alias>, http://host:port or https://host:port; overrides REVIT_MCP_HOST.",
+        help=(
+            "local (named pipe, file channel fallback), ssh:<alias> (file channel over SSH), "
+            "http://host:port or https://host:port; overrides REVIT_MCP_HOST."
+        ),
     )
     parser.add_argument(
         "--redact-paths",

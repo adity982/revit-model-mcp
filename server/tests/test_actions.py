@@ -8,7 +8,7 @@ from mcp import Client, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.server import MCPServer
 
-from revit_model_mcp.actions import millimeters_to_feet, register_actions
+from revit_model_mcp.actions import _send_action, millimeters_to_feet, register_actions
 from revit_model_mcp.revit_channel import (
     JobPickupStatus,
     ReadJob,
@@ -26,27 +26,38 @@ ACTION_TOOLS = {
     "revit_set_parameter",
     "revit_delete",
     "revit_batch",
+    "revit_export_nwc",
+    "revit_edit_families",
+    "revit_align_link_datums",
+    "revit_open_document",
+    "revit_close_document",
+    "revit_save_document",
+    "revit_sync_document",
+    "revit_set_view_visibility",
+    "revit_remove_links",
+    "revit_undo_last",
 }
 
 
-@pytest.mark.parametrize("flag", [None, "0", "true", "1"])
-def test_stdio_action_gate(flag):
+@pytest.mark.parametrize("read_only", [None, "0", "1", "true"])
+def test_stdio_action_tools_listed_regardless_of_read_only(read_only):
     import asyncio
 
     async def check():
         env = os.environ.copy()
-        env.pop("REVIT_MCP_ALLOW_WRITE", None)
-        if flag is not None:
-            env["REVIT_MCP_ALLOW_WRITE"] = flag
+        env.pop("REVIT_MCP_READ_ONLY", None)
+        if read_only is not None:
+            env["REVIT_MCP_READ_ONLY"] = read_only
         parameters = StdioServerParameters(command="revit-model-mcp", args=[], env=env)
         async with Client(stdio_client(parameters), read_timeout_seconds=10) as client:
             result = await client.list_tools()
         tools = {tool.name: tool for tool in result.tools}
-        assert ACTION_TOOLS.intersection(tools) == (
-            ACTION_TOOLS if flag in {"1", "true"} else set()
-        )
-        for name in ACTION_TOOLS.intersection(tools):
+        assert ACTION_TOOLS.issubset(tools)
+        for name in ACTION_TOOLS:
             tool = tools[name]
+            assert ("response_timeout_s" in tool.input_schema["properties"]) is (
+                name in {"revit_export_nwc", "revit_edit_families", "revit_align_link_datums"}
+            )
             assert tool.annotations.read_only_hint is False
             assert tool.title and len(tool.title) <= 40
             assert tool.annotations.title == tool.title
@@ -58,14 +69,300 @@ def test_stdio_action_gate(flag):
     asyncio.run(check())
 
 
-def action_server():
+def test_stdio_read_only_blocks_execution_without_hiding_tools():
+    import asyncio
+
+    async def check():
+        env = os.environ.copy()
+        env["REVIT_MCP_READ_ONLY"] = "1"
+        parameters = StdioServerParameters(command="revit-model-mcp", args=[], env=env)
+        async with Client(stdio_client(parameters), read_timeout_seconds=10) as client:
+            listed = await client.list_tools()
+            assert "revit_select" in {tool.name for tool in listed.tools}
+            result = await client.call_tool("revit_select", {"element_ids": []})
+        assert "read-only mode" in str(result)
+
+    asyncio.run(check())
+
+
+def action_server(read_only=False):
     server = MCPServer("actions-test")
     execute = AsyncMock(return_value={"success": True, "data": {}, "activeView": "Level 1"})
     host = AsyncMock()
     host.list_revit_instances.return_value = [{"processId": 42}]
-    with patch.dict(os.environ, {"REVIT_MCP_ALLOW_WRITE": "1"}):
+    with patch.dict(os.environ, {"REVIT_MCP_READ_ONLY": "1" if read_only else "0"}):
         register_actions(server, execute, lambda: host)
     return server, execute, host
+
+
+def test_document_action_mapping_and_confirmation_shape():
+    import asyncio
+
+    server, execute, _ = action_server()
+    execute.return_value = {
+        "success": True,
+        "data": {
+            "needsConfirmation": True,
+            "confirmationText": "Synchronize Tower with central.",
+            "confirmToken": "random-token",
+        },
+    }
+    first = asyncio.run(
+        server.call_tool("revit_sync_document", {"document": "Tower", "comment": "grids"})
+    )
+    assert "confirmationText" in str(first)
+    payload = execute.await_args.args[0].payload
+    assert payload["command"] == "sync-document"
+    assert payload["targetDocument"] == "Tower"
+    assert payload["comment"] == "grids"
+    assert payload["confirmToken"] is None
+    asyncio.run(
+        server.call_tool(
+            "revit_sync_document",
+            {"document": "Tower", "comment": "grids", "confirm_token": "random-token"},
+        )
+    )
+    assert execute.await_args.args[0].payload["confirmToken"] == "random-token"
+
+    asyncio.run(
+        server.call_tool(
+            "revit_open_document",
+            {"path": "RSN://srv/AR/House.rvt", "worksets": {"open": ["A"]}},
+        )
+    )
+    assert execute.await_args.args[0].payload["worksets"] == "open"
+    assert execute.await_args.args[0].payload["worksetsOpen"] == ["A"]
+
+
+def test_view_visibility_and_link_removal_argument_mapping():
+    import asyncio
+
+    server, execute, _ = action_server()
+    asyncio.run(
+        server.call_tool(
+            "revit_set_view_visibility",
+            {
+                "view": "NWC 3D",
+                "hide_categories_by_type": ["annotation"],
+                "worksets": {"hide_mask": ["HVAC*"], "show_mask": []},
+                "template_mode": "duplicate_view",
+                "dry_run": True,
+            },
+        )
+    )
+    payload = execute.await_args.args[0].payload
+    assert payload["command"] == "set-view-visibility"
+    assert payload["hideCategoriesByType"] == ["annotation"]
+    assert payload["worksets"] == {"hideMask": ["HVAC*"], "showMask": []}
+    assert payload["templateMode"] == "duplicate_view"
+    assert payload["dryRun"] is True
+
+    asyncio.run(
+        server.call_tool(
+            "revit_remove_links",
+            {
+                "links": "*",
+                "kinds": ["revit", "image"],
+                "include_imported_cad": True,
+            },
+        )
+    )
+    payload = execute.await_args.args[0].payload
+    assert payload["command"] == "remove-links"
+    assert payload["links"] == ["*"]
+    assert payload["kinds"] == ["revit", "image"]
+    assert payload["includeImportedCad"] is True
+
+
+def test_document_action_response_paths_are_redacted_when_enabled():
+    import asyncio
+
+    server, execute, _ = action_server()
+    execute.return_value = {
+        "success": True,
+        "data": {
+            "title": "Tower",
+            "path": r"C:\Models\Tower_local.rvt",
+            "centralPath": r"RSN://srv/AR/Tower.rvt",
+        },
+    }
+    with patch.dict(os.environ, {"REVIT_MCP_REDACT_PATHS": "1"}):
+        result = asyncio.run(
+            server.call_tool("revit_close_document", {"document": "Tower", "confirm_token": "tok"})
+        )
+    data = result.structured_content["data"]
+    assert data["path"] == "Tower_local.rvt"
+    assert data["centralPath"] == "Tower.rvt"
+
+
+def test_nwc_export_defaults_and_options_reach_channel():
+    import asyncio
+
+    server, execute, _ = action_server()
+    asyncio.run(server.call_tool("revit_export_nwc", {"path": "C:\\x\\a.nwc"}))
+    payload = execute.await_args.args[0].payload
+    assert execute.await_args.args[1] == 1800
+    assert payload == {
+        "command": "export-nwc",
+        "targetProcessId": 42,
+        "path": "C:\\x\\a.nwc",
+        "overwrite": False,
+        "dryRun": False,
+    }
+
+
+def test_nwc_xml_and_explicit_false_reach_channel():
+    import asyncio
+
+    server, execute, _ = action_server()
+    asyncio.run(
+        server.call_tool(
+            "revit_export_nwc",
+            {
+                "path": "C:\\x\\a.nwc",
+                "settings_xml": "C:\\x\\settings.xml",
+                "export_links": False,
+            },
+        )
+    )
+    payload = execute.await_args.args[0].payload
+    assert payload["settingsXml"] == "C:\\x\\settings.xml"
+    assert payload["exportLinks"] is False
+    assert "parameters" not in payload
+
+
+def test_nwc_export_overrides_reach_channel():
+    import asyncio
+
+    server, execute, _ = action_server()
+    asyncio.run(
+        server.call_tool(
+            "revit_export_nwc",
+            {
+                "path": "C:\\x\\a.nwc",
+                "scope": "selection",
+                "element_ids": [1],
+                "coordinates": "internal",
+                "parameters": "none",
+                "export_element_ids": False,
+                "convert_element_properties": True,
+                "export_parts": True,
+                "export_room_as_attribute": False,
+                "export_room_geometry": False,
+                "convert_lights": True,
+                "convert_linked_cad_formats": False,
+                "export_links": True,
+                "export_urls": False,
+                "divide_file_into_levels": False,
+                "find_missing_materials": False,
+                "faceting_factor": 5,
+                "overwrite": True,
+                "dry_run": True,
+                "response_timeout_s": 900,
+            },
+        )
+    )
+    payload = execute.await_args.args[0].payload
+    assert execute.await_args.args[1] == 900
+    assert payload["elementIds"] == [1]
+    assert payload["coordinates"] == "internal"
+    assert payload["parameters"] == "none"
+    for key in (
+        "exportElementIds",
+        "exportRoomAsAttribute",
+        "exportRoomGeometry",
+        "convertLinkedCadFormats",
+        "exportUrls",
+        "divideFileIntoLevels",
+        "findMissingMaterials",
+    ):
+        assert payload[key] is False
+    for key in ("convertElementProperties", "exportParts", "convertLights", "exportLinks"):
+        assert payload[key] is True
+    assert payload["facetingFactor"] == 5
+    assert payload["overwrite"] is True
+    assert payload["dryRun"] is True
+
+
+def test_align_link_datums_payload_and_timeout():
+    import asyncio
+
+    server, execute, _ = action_server()
+    asyncio.run(
+        server.call_tool(
+            "revit_align_link_datums",
+            {
+                "link": "AR.rvt : 1",
+                "kinds": ["grids"],
+                "name_map": {"A": "A1"},
+                "level_offset_mm": 150,
+                "dry_run": True,
+                "response_timeout_s": 600,
+            },
+        )
+    )
+    job = execute.await_args.args[0]
+    assert job.command == "align-link-datums"
+    assert job.payload["nameMap"] == {"A": "A1"}
+    assert job.payload["dryRun"] is True
+    assert execute.await_args.args[1] == 600
+
+
+def test_undo_last_sends_command_without_extra_arguments():
+    import asyncio
+
+    server, execute, host = action_server()
+    asyncio.run(server.call_tool("revit_undo_last", {"document": "Model"}))
+    job = execute.await_args.args[0]
+    assert job.command == "undo-last"
+    assert job.payload["targetDocument"] == "Model"
+    host.list_revit_instances.assert_awaited_once()
+
+
+def test_undo_last_in_read_only_mode_never_reaches_channel():
+    import asyncio
+
+    server, execute, host = action_server(read_only=True)
+    result = asyncio.run(server.call_tool("revit_undo_last", {}))
+    assert "read-only mode" in str(result)
+    execute.assert_not_awaited()
+    host.list_revit_instances.assert_not_awaited()
+
+
+def test_align_link_datums_rejects_invalid_timeout():
+    import asyncio
+
+    server, execute, _ = action_server()
+    with pytest.raises(Exception):
+        asyncio.run(
+            server.call_tool("revit_align_link_datums", {"link": "AR.rvt", "response_timeout_s": 0})
+        )
+    execute.assert_not_awaited()
+
+
+def test_compare_link_datums_is_read_only():
+    import asyncio
+
+    from revit_model_mcp import server as revit_server
+
+    channel = AsyncMock(return_value={"success": True})
+    with patch.object(revit_server, "channel") as mock_channel:
+        mock_channel.execute = channel
+        asyncio.run(revit_server.revit_compare_link_datums("AR.rvt", name_map={"A": "A1"}))
+    job = channel.await_args.args[0]
+    assert job.command == "compare-link-datums"
+    assert job.payload["nameMap"] == {"A": "A1"}
+
+
+@pytest.mark.parametrize("response_timeout_s", [None, 900])
+def test_action_response_timeout_reaches_channel(response_timeout_s):
+    import asyncio
+
+    _, execute, host = action_server()
+    timeout = {} if response_timeout_s is None else {"response_timeout_s": response_timeout_s}
+    asyncio.run(_send_action(execute, lambda: host, "select", elementIds=[1], **timeout))
+    execute.assert_awaited_once()
+    assert execute.await_args.args[1:] == (response_timeout_s or 120, 300, None)
 
 
 @pytest.mark.parametrize(
@@ -251,6 +548,9 @@ def test_addressed_action_channel_preserves_target_and_response(payload, documen
     sent = json.loads(host.prepare_job.await_args.args[1])
     correlation_id = sent.pop("correlationId")
     assert len(correlation_id) == 32
+    assert len(sent.pop("jobId")) == 32
+    assert len(sent.pop("clientId")) == 32
+    assert sent.pop("clientName") == "unknown"
     assert host.wait_for_new_response.await_args.args[3] == correlation_id
     assert sent == {
         **payload,
@@ -386,10 +686,9 @@ def test_batch_payload_and_annotations(dry_run, document_arguments):
     assert tool.annotations.idempotent_hint is False
 
 
-def test_in_process_action_titles_with_true(monkeypatch):
+def test_in_process_action_titles():
     import asyncio
 
-    monkeypatch.setenv("REVIT_MCP_ALLOW_WRITE", "true")
     server = MCPServer("action-titles")
     register_actions(server, AsyncMock(), lambda: AsyncMock())
     tools = asyncio.run(server.list_tools())
@@ -401,3 +700,45 @@ def test_in_process_action_titles_with_true(monkeypatch):
         assert tool.annotations.destructive_hint is (
             tool.name not in {"revit_select", "revit_show", "revit_isolate"}
         )
+
+
+def test_edit_families_maps_discriminated_operations_and_defaults():
+    import asyncio
+
+    server, execute, _ = action_server()
+    asyncio.run(
+        server.call_tool(
+            "revit_edit_families",
+            {
+                "families": ["Door"],
+                "operations": [
+                    {
+                        "op": "add_shared_parameters",
+                        "parameters": [{"name": "Tag", "group": "Data"}],
+                    },
+                    {"op": "remove_parameters", "names": ["Old"]},
+                    {"op": "purge"},
+                    {"op": "set_shared", "shared": True},
+                ],
+            },
+        )
+    )
+    job = execute.await_args.args[0]
+    assert job.command == "edit-families"
+    assert job.payload["overwriteParameterValues"] is False
+    assert job.payload["stopOnError"] is True
+    assert job.payload["dryRun"] is False
+    assert job.payload["operations"][0]["replaceFamilyParameter"] is False
+    assert job.payload["operations"][0]["parameters"][0]["instance"] is True
+    assert job.payload["operations"][1]["includeShared"] is False
+    assert execute.await_args.args[1] == 1800
+
+
+def test_edit_families_rejects_unknown_op_and_empty_names():
+    import asyncio
+
+    server, execute, _ = action_server()
+    for operations in ([{"op": "unknown"}], [{"op": "remove_parameters", "names": []}]):
+        with pytest.raises(Exception):
+            asyncio.run(server.call_tool("revit_edit_families", {"operations": operations}))
+    execute.assert_not_awaited()
