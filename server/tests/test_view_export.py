@@ -2,12 +2,20 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock
 
-from revit_model_mcp.revit_channel import JobPickupStatus, ReadJob, RevitReadChannel
+from revit_model_mcp.artifact_download import save_artifact
+from revit_model_mcp.revit_channel import (
+    JobPickupStatus,
+    ReadJob,
+    ResponseParseError,
+    RevitChannelError,
+    RevitReadChannel,
+)
 from revit_model_mcp.ssh_host import SshPowerShellHost
 
 EXPORT_RESPONSE = json.dumps(
@@ -26,6 +34,7 @@ EXPORT_RESPONSE = json.dumps(
     },
     ensure_ascii=False,
 )
+PNG = b"\x89PNG\r\n\x1a\n" + b"image-content"
 
 
 class ViewExportTests(unittest.IsolatedAsyncioTestCase):
@@ -44,7 +53,7 @@ class ViewExportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job.save_to, "/tmp/plan.png")
 
     async def test_downloads_image_in_same_remote_read_and_saves_path(self) -> None:
-        image = b"pngdata"
+        image = PNG
         package = json.dumps(
             {
                 "response": base64.b64encode(EXPORT_RESPONSE.encode()).decode(),
@@ -57,8 +66,8 @@ class ViewExportTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "saved.png"
             content, local_path = await host.finish_job(
-                "response_export-view.json",
-                ["mcp.tmp", "response_export-view.json"],
+                "response_20260916_120000_000_export-view.json",
+                ["mcp.tmp", "response_20260916_120000_000_export-view.json"],
                 True,
                 str(target),
             )
@@ -72,6 +81,110 @@ class ViewExportTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("response.data.fileName", script)
         self.assertIn("ReadAllBytes($artifactPath)", script)
         self.assertIn("Remove-Item", script)
+
+    async def test_finish_job_reports_destination_errors_plainly(self) -> None:
+        host = SshPowerShellHost()
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "image.png"
+            target.write_bytes(b"original")
+            cases = (
+                (target, PNG, "Local file already exists:"),
+                (
+                    Path(directory) / "image.txt",
+                    PNG,
+                    "The image destination must have a .png extension.",
+                ),
+                (
+                    Path(directory) / "invalid.png",
+                    b"not a PNG",
+                    "The Revit endpoint did not return a PNG image.",
+                ),
+            )
+            for destination, image, message in cases:
+                with self.subTest(message=message):
+                    host._run = AsyncMock(
+                        return_value=json.dumps(
+                            {
+                                "response": base64.b64encode(EXPORT_RESPONSE.encode()).decode(),
+                                "artifactName": "view.png",
+                                "artifact": base64.b64encode(image).decode(),
+                            }
+                        )
+                    )
+                    with self.assertRaisesRegex(RevitChannelError, message):
+                        await host.finish_job(
+                            "response_20260916_120000_000_export-view.json",
+                            [],
+                            True,
+                            str(destination),
+                        )
+
+    async def test_finish_job_wraps_invalid_artifact_base64_as_parse_error(self) -> None:
+        host = SshPowerShellHost()
+        host._run = AsyncMock(
+            return_value=json.dumps(
+                {
+                    "response": base64.b64encode(EXPORT_RESPONSE.encode()).decode(),
+                    "artifactName": "view.png",
+                    "artifact": "not base64",
+                }
+            )
+        )
+
+        with self.assertRaisesRegex(
+            ResponseParseError, "Could not parse response and image after remote read:"
+        ):
+            await host.finish_job("response_20260916_120000_000_export-view.json", [], True, None)
+
+    def test_save_artifact_refuses_existing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "image.png"
+            target.write_bytes(b"original")
+            package = {"artifactName": "view.png", "artifact": base64.b64encode(PNG).decode()}
+            with self.assertRaisesRegex(ValueError, "already exists"):
+                save_artifact(package, str(target))
+            self.assertEqual(target.read_bytes(), b"original")
+
+    def test_save_artifact_refuses_symlink(self) -> None:
+        if os.name == "nt":
+            self.skipTest("Creating symlinks requires additional privileges on Windows")
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "image.png"
+            destination = Path(directory) / "destination.png"
+            destination.write_bytes(b"original")
+            target.symlink_to(destination)
+            package = {"artifactName": "view.png", "artifact": base64.b64encode(PNG).decode()}
+            with self.assertRaisesRegex(ValueError, "already exists"):
+                save_artifact(package, str(target))
+            self.assertEqual(destination.read_bytes(), b"original")
+
+    def test_save_artifact_refuses_non_png(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "image.png"
+            package = {
+                "artifactName": "view.png",
+                "artifact": base64.b64encode(b"not a PNG").decode(),
+            }
+            with self.assertRaisesRegex(ValueError, "PNG image"):
+                save_artifact(package, str(target))
+            self.assertFalse(target.exists())
+
+    def test_save_artifact_requires_png_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "image.txt"
+            package = {"artifactName": "view.png", "artifact": base64.b64encode(PNG).decode()}
+            with self.assertRaisesRegex(ValueError, ".png extension"):
+                save_artifact(package, str(target))
+            self.assertFalse(target.exists())
+
+    def test_save_artifact_writes_valid_png(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "nested" / "image.PNG"
+            package = {"artifactName": "view.png", "artifact": base64.b64encode(PNG).decode()}
+            self.assertEqual(
+                save_artifact(package, str(target)), str(target.parent.resolve() / target.name)
+            )
+            self.assertEqual(target.read_bytes(), PNG)
 
     async def test_channel_returns_local_path_with_plugin_metadata(self) -> None:
         events: list[str] = []

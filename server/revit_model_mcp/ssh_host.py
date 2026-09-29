@@ -2,16 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import copy
 import json
 import logging
 import os
 import re
 import shlex
+import stat
+import tempfile
 from collections import deque
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
 
 from revit_model_mcp.artifact_download import save_artifact
@@ -40,6 +44,14 @@ ACTIVATION_DELAY_SECONDS = 60.0
 INSTANCE_STALE_SECONDS = 60.0
 HANDSHAKE_TIMEOUT_SECONDS = 60.0
 LOGGER = logging.getLogger(__name__)
+RESPONSE_NAME = re.compile(
+    r"response_[0-9]{8}_[0-9]{6}_[0-9]{3}_[A-Za-z0-9_-]+"
+    r"(?:_(?:[A-Za-z0-9_.~-]|%[0-9A-Fa-f]{2})+)?\.json\Z"
+)
+STARTED_UTC = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]{1,7})?(?:Z|[+-][0-9]{2}:[0-9]{2})\Z"
+)
 
 
 class RemoteCommandTimeoutError(RevitChannelError):
@@ -103,6 +115,14 @@ class SshPowerShellHost:
             raise RevitChannelError(
                 "The selected Revit instance has no startup identity; its file channel is unconfirmed."
             )
+        if version == 2:
+            try:
+                started_utc = _validated_started_utc(instance["startedUtc"])
+            except ValueError as error:
+                raise RevitChannelError(
+                    "The selected Revit instance has an invalid startup identity. Update the add-in."
+                ) from error
+            instance = {**instance, "startedUtc": started_utc}
         selected = copy.copy(self)
         selected._instance = dict(instance)
         selected._directory = (
@@ -230,7 +250,7 @@ class SshPowerShellHost:
         responses = result.get("responses")
         if not isinstance(responses, list) or not all(isinstance(x, str) for x in responses):
             raise ResponseParseError("Preparation result contains an invalid response list.")
-        return set(responses)
+        return {name for name in responses if RESPONSE_NAME.fullmatch(name)}
 
     async def wait_until_trigger_is_gone(self, timeout_seconds: float) -> JobPickupStatus:
         trigger_assignment = f"$trigger = Join-Path ({self._directory}) '{self._published_job_file or TRIGGER_FILE}'; "
@@ -289,7 +309,9 @@ class SshPowerShellHost:
         timeout_seconds: float,
         correlation_id: str | None = None,
     ) -> str | None:
-        known = ",".join(f"'{_ps_quote(name)}'" for name in sorted(known_names))
+        known = ",".join(
+            f"'{_ps_quote(name)}'" for name in sorted(known_names) if RESPONSE_NAME.fullmatch(name)
+        )
         pattern = f"response_*_{command}*.json"
         selection = "Select-Object -Last 1"
         if correlation_id is not None:
@@ -311,12 +333,12 @@ class SshPowerShellHost:
             _ps_response_reader()
             + f"$directory = {self._directory}; $known = @({known}); $matched = $null; $legacy = $null; "
             f"$candidate = Get-ChildItem -LiteralPath $directory -Filter '{pattern}' -File -ErrorAction SilentlyContinue | "
-            "Where-Object { $known -notcontains $_.Name } | Sort-Object LastWriteTimeUtc | "
+            f"Where-Object {{ $_.Name -cmatch '{RESPONSE_NAME.pattern}' -and $known -notcontains $_.Name }} | Sort-Object LastWriteTimeUtc | "
             + selection
             + "; if ($null -ne $candidate) { $candidate.Name }"
         )
         result, _, _ = await self._poll_for_change(script, "", timeout_seconds)
-        return result
+        return result if result is None or RESPONSE_NAME.fullmatch(result) else None
 
     async def _poll_for_change(
         self,
@@ -377,6 +399,8 @@ class SshPowerShellHost:
         download_artifact: bool,
         save_to: str | None,
     ) -> tuple[str, str | None]:
+        if not RESPONSE_NAME.fullmatch(response_name):
+            raise ResponseParseError("Remote response has an invalid file name. Update the add-in.")
         paths = ",".join(f"'{_ps_quote(name)}'" for name in cleanup_names)
         output = await self._run(
             _ps_response_reader()
@@ -401,12 +425,30 @@ class SshPowerShellHost:
         try:
             result = json.loads(output)
             content = base64.b64decode(result["response"], validate=True).decode("utf-8-sig")
-            local_path = save_artifact(result, save_to) if download_artifact else None
-            return content, local_path
+            if download_artifact:
+                name = result.get("artifactName")
+                encoded = result.get("artifact")
+                if (
+                    not isinstance(name, str)
+                    or Path(name).name != name
+                    or not isinstance(encoded, str)
+                ):
+                    raise ValueError("Remote response does not contain a safe image artifact.")
         except (KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ResponseParseError(
                 f"Could not parse response and image after remote read: {error}"
             ) from error
+        if not download_artifact:
+            return content, None
+        try:
+            local_path = save_artifact(result, save_to)
+        except binascii.Error as error:
+            raise ResponseParseError(
+                f"Could not parse response and image after remote read: {error}"
+            ) from error
+        except ValueError as error:
+            raise RevitChannelError(str(error)) from error
+        return content, local_path
 
     async def delete_files(self, names: list[str]) -> None:
         if not names:
@@ -434,27 +476,31 @@ class SshPowerShellHost:
             "BatchMode=yes",
             "-o",
             f"ConnectTimeout={self.connect_timeout_seconds}",
+            "-T",
+            "-a",
+            "-x",
+            "-o",
+            "ClearAllForwardings=yes",
+            "-o",
+            "ForwardAgent=no",
+            "-o",
+            "ForwardX11=no",
+            "-o",
+            "PermitLocalCommand=no",
         ]
         if os.environ.get("REVIT_MCP_SSH_MUX") != "0":
-            runtime = os.environ.get("XDG_RUNTIME_DIR")
-            # Unix sockets cap the path at about 100 bytes and ssh appends a random suffix, so keep this short.
-            directory = (
-                Path(runtime)
-                if runtime
-                else Path("/tmp") / f"revit-model-mcp-{getattr(os, 'getuid', lambda: 'user')()}"
-            )
-            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-            directory.chmod(0o700)
-            command.extend(
-                [
-                    "-o",
-                    "ControlMaster=auto",
-                    "-o",
-                    f"ControlPath={directory}/mux-%C",
-                    "-o",
-                    "ControlPersist=600",
-                ]
-            )
+            directory = _mux_directory(os.environ.get("XDG_RUNTIME_DIR"))
+            if directory is not None:
+                command.extend(
+                    [
+                        "-o",
+                        "ControlMaster=auto",
+                        "-o",
+                        f"ControlPath={directory}/mux-%C",
+                        "-o",
+                        "ControlPersist=600",
+                    ]
+                )
         command.extend(shlex.split(os.environ.get("REVIT_MCP_SSH_OPTIONS", "")))
         return command + [self.host] + powershell
 
@@ -550,6 +596,8 @@ def _parse_instance_package(
             updated = datetime.fromisoformat(status["updatedUtc"].replace("Z", "+00:00"))
             if updated.tzinfo is None or updated < stale_before:
                 continue
+            if "startedUtc" in status:
+                status["startedUtc"] = _validated_started_utc(status["startedUtc"])
             process_id = status["processId"]
             if process_id not in running or item.get("name") != f"instance_{process_id}.json":
                 continue
@@ -631,7 +679,47 @@ def _ps_directory() -> str:
 
 
 def _ps_quote(value: str) -> str:
-    return value.replace("'", "''")
+    for quote in ("'", "\u2018", "\u2019", "\u201a", "\u201b"):
+        value = value.replace(quote, quote * 2)
+    return value
+
+
+def _validated_started_utc(value: object) -> str:
+    if not isinstance(value, str) or not STARTED_UTC.fullmatch(value):
+        raise ValueError("startup identity is not a timestamp")
+    started = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if started.tzinfo is None:
+        raise ValueError("startup identity has no time zone")
+    return value
+
+
+@lru_cache(maxsize=None)
+def _mux_directory(runtime: str | None) -> Path | None:
+    try:
+        home = Path.home()
+        temporary = Path(tempfile.gettempdir())
+        if runtime:
+            directory = Path(runtime)
+        elif temporary != Path("/tmp"):
+            directory = temporary / f"revit-model-mcp-{getattr(os, 'getuid', lambda: 'user')()}"
+        else:
+            directory = home / ".cache" / "revit-model-mcp"
+        if len(os.fsencode(f"{directory}/mux-{'0' * 40}")) > 86:
+            directory = home / ".cache" / "rmm"
+        if len(os.fsencode(f"{directory}/mux-{'0' * 40}")) > 86:
+            raise ValueError("multiplexing socket path is too long")
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if hasattr(os, "getuid"):
+            details = os.lstat(directory)
+            if not stat.S_ISDIR(details.st_mode) or details.st_uid != os.getuid():
+                raise ValueError("multiplexing directory is not owned by this user")
+        directory.chmod(0o700)
+        return directory
+    except (OSError, RuntimeError, ValueError) as error:
+        LOGGER.warning(
+            "SSH multiplexing disabled: %s. Set REVIT_MCP_SSH_MUX=0 to silence this warning.", error
+        )
+        return None
 
 
 def _looks_like_connection_failure(detail: str) -> bool:

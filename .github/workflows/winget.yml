@@ -1,10 +1,9 @@
-# WINGET_TOKEN is a classic GitHub PAT with public_repo scope.
+# WINGET_TOKEN is a classic GitHub PAT with public_repo and workflow scopes.
+# The workflow scope is needed to sync the winget-pkgs fork.
 # Without it, manifests are generated and uploaded without submission.
 name: WinGet
 
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       release_tag:
@@ -26,16 +25,15 @@ permissions:
 jobs:
   manifests:
     if: >-
-      !github.event.release.prerelease &&
-      !contains(inputs.release_tag || github.event.release.tag_name, '-')
+      !contains(inputs.release_tag, '-')
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Generate manifests
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           $releaseJson = gh release view $env:RELEASE_TAG --repo '${{ github.repository }}' --json isPrerelease,isDraft,tagName
           if ($LASTEXITCODE -ne 0) { throw 'Release lookup failed' }
@@ -79,7 +77,7 @@ jobs:
           }
           "install_tested=$tested" >> $env:GITHUB_OUTPUT
           $global:LASTEXITCODE = 0
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: winget-manifests
           path: artifacts/winget/*.yaml
@@ -89,32 +87,47 @@ jobs:
         shell: pwsh
         env:
           WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_TOKEN }}
           GH_TOKEN: ${{ github.token }}
           INSTALL_TESTED: ${{ steps.install_test.outputs.install_tested }}
-          RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           if (!$env:WINGET_TOKEN) {
             Write-Host 'WINGET_TOKEN is not set. Manifests are available in the artifact.'
             exit 0
           }
-          gh release download --repo microsoft/winget-create --pattern wingetcreate.exe --dir "$env:RUNNER_TEMP/wingetcreate"
+          gh release download v1.12.13.0 --repo microsoft/winget-create --pattern wingetcreate.exe --dir "$env:RUNNER_TEMP/wingetcreate"
           if ($LASTEXITCODE -ne 0) { throw 'wingetcreate download failed' }
+          $actualHash = (Get-FileHash "$env:RUNNER_TEMP/wingetcreate/wingetcreate.exe" -Algorithm SHA256).Hash
+          if ($actualHash -ne '24042bd37915805615e6cf969ac57c6439124c3fe85823327f5f3fb24bd9ffea') {
+            throw 'wingetcreate SHA256 mismatch'
+          }
+          $version = $env:RELEASE_TAG.Substring(1)
           # One PR per package version: a pipeline re-run must not open a duplicate in winget-pkgs.
           $env:GH_TOKEN = $env:WINGET_TOKEN
-          $existing = gh pr list --repo microsoft/winget-pkgs --state open --search "Sharafutdinov.RevitModelMcp version $env:RELEASE_TAG.Substring(1) in:title" --json number,title --jq ".[] | select(.title == \"Sharafutdinov.RevitModelMcp version $env:RELEASE_TAG.Substring(1)\") | .number" | Select-Object -First 1
+          $title = "Sharafutdinov.RevitModelMcp version $version"
+          $existingJson = gh pr list --repo microsoft/winget-pkgs --state open --search "$title in:title" --json number,title
+          if ($LASTEXITCODE -ne 0) { throw 'Could not check for an open WinGet pull request' }
+          $existing = $existingJson | ConvertFrom-Json | Where-Object { $_.title -eq $title } | Select-Object -First 1 -ExpandProperty number
           if ($existing) {
-            Write-Host "A pull request for Sharafutdinov.RevitModelMcp $env:RELEASE_TAG.Substring(1) is already open: https://github.com/microsoft/winget-pkgs/pull/$existing"
+            Write-Host "A pull request for Sharafutdinov.RevitModelMcp $version is already open: https://github.com/microsoft/winget-pkgs/pull/$existing"
             $global:LASTEXITCODE = 0
             exit 0
           }
+          $forkOwner = gh api user --jq .login
+          if ($LASTEXITCODE -ne 0) { throw 'Could not determine the WinGet token owner' }
+          gh repo view "$forkOwner/winget-pkgs" --json name > $null 2>&1
+          if ($LASTEXITCODE -eq 0) {
+            gh repo sync "$forkOwner/winget-pkgs" --branch master
+            if ($LASTEXITCODE -ne 0) { throw "Could not sync $forkOwner/winget-pkgs with microsoft/winget-pkgs; WINGET_TOKEN needs the public_repo and workflow scopes" }
+          }
           $submitLog = "$env:RUNNER_TEMP/wingetcreate-submit.txt"
-          & "$env:RUNNER_TEMP/wingetcreate/wingetcreate.exe" submit artifacts/winget --token $env:WINGET_TOKEN 2>&1 | Tee-Object -FilePath $submitLog | Out-String | Write-Host
+          & "$env:RUNNER_TEMP/wingetcreate/wingetcreate.exe" submit artifacts/winget 2>&1 | Tee-Object -FilePath $submitLog | Out-String | Write-Host
           if ($LASTEXITCODE -ne 0) { throw 'WinGet submission failed' }
           $prUrl = (Select-String -Path $submitLog -Pattern 'https://github.com/microsoft/winget-pkgs/pull/\d+' -AllMatches).Matches.Value | Select-Object -Last 1
           if (-not $prUrl) { throw 'wingetcreate did not print a pull request URL' }
           "prUrl=$prUrl" >> $env:GITHUB_OUTPUT
           # wingetcreate submits the PR template unfilled; complete it with what this workflow verified.
-          $version = $env:RELEASE_TAG.Substring(1)
           if ($env:INSTALL_TESTED -eq 'true') {
             $installLine = '- [x] Tested manifest locally with ``winget install --manifest <path>`` (installed and uninstalled in the release workflow on windows-latest; the project CI also runs silent install and uninstall smoke tests)'
           } else {
