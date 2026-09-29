@@ -42,7 +42,7 @@ The workstation `read-only` file refuses action jobs only. It does not restrict 
 For SSH stdio, prefix a dedicated public key entry in `authorized_keys` with `restrict,command="revit-model-mcp --redact-paths"`.
 Windows OpenSSH administrators place this entry in `%ProgramData%\ssh\administrators_authorized_keys`.
 The `ssh:<alias>` file channel requires a full shell key and cannot use this forced command.
-The default multiplexing socket directory has mode `0700` on macOS and Linux.
+On macOS and Linux, the default multiplexing socket directory is verified as user-owned and set to mode `0700`; multiplexing is disabled if this fails.
 The Windows file channel relies on the account's filesystem permissions.
 See [transport](transport.md) and [security reporting](../SECURITY.md).
 
